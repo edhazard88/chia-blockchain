@@ -272,6 +272,7 @@ async def make_and_send_spend_bundle(
         signature = G2Element()
     spend_bundle = SpendBundle(coin_spends, signature)
     status, error = await sim_client.push_tx(spend_bundle)
+    print("status, error: ", (status, error))
     if error is None and farm_afterwards:
         await sim.farm_block()
     return status, error
@@ -291,7 +292,7 @@ def make_singleton_coin_spend(
     inner_puzzle: Program,
     inner_conditions: List[List[Any]],
     is_eve_spend: bool = False,
-) -> CoinSpend:
+) -> Tuple[CoinSpend, Program]:
     lineage_proof = singleton_top_layer.lineage_proof_for_coinsol(parent_coin_spend)
     delegated_puzzle = Program.to((1, inner_conditions))
     inner_solution = Program.to([[], delegated_puzzle, []])
@@ -303,7 +304,7 @@ def make_singleton_coin_spend(
         )
     else:
         puzzle_reveal = parent_coin_spend.puzzle_reveal
-    return CoinSpend(coin_to_spend, puzzle_reveal, solution)
+    return CoinSpend(coin_to_spend, puzzle_reveal, solution), delegated_puzzle
 
 
 async def prepare_singleton_eve(
@@ -329,9 +330,9 @@ async def prepare_singleton_eve(
         coin=starting_coin, inner_puzzle=inner_puzzle, comment=[], amount=start_amount
     )
     # Keep a remaining coin with an even amount
-    # conditions.append(
-    #     Program.to([ConditionOpcode.CREATE_COIN, IDENTITY_PUZZLE_HASH, starting_coin.amount - start_amount - 1])
-    # )
+    conditions.append(
+        Program.to([ConditionOpcode.CREATE_COIN, IDENTITY_PUZZLE_HASH, starting_coin.amount - start_amount - 1])
+    )
     # Create a solution for standard transaction
     delegated_puzzle = p2_conditions.puzzle_for_conditions(conditions)
     full_solution = p2_delegated_puzzle_or_hidden_puzzle.solution_for_conditions(conditions)
@@ -346,24 +347,25 @@ async def prepare_singleton_eve(
         is_launcher_coin=True,
     )
     # Eve coin
-    # eve_coin, [remaining_coin] = await get_singleton_and_remaining_coins(sim)
     eve_coin, _ = await get_singleton_and_remaining_coins(sim)
+    # eve_coin, _ = await get_singleton_and_remaining_coins(sim)
     # print("remaining_coin amount: ", remaining_coin.amount)
     print("eve_coin.amount: ", eve_coin.amount)
     inner_conditions = [[ConditionOpcode.CREATE_COIN, inner_puzzle_hash, singleton_amount]]
     singleton_eve_coin_spend = make_singleton_coin_spend(
         parent_coin_spend=launcher_coin_spend,
         coin_to_spend=eve_coin,
-        inner_puzzle=starting_puzzle,
+        inner_puzzle=inner_puzzle,
         inner_conditions=inner_conditions,
         is_eve_spend=True,
+        is_eligible_for_ff=is_eligible_for_ff,
     )
-    status, error = await make_and_send_spend_bundle(
-        sim, sim_client, eve_coin, delegated_puzzle, [singleton_eve_coin_spend], is_eligible_for_ff
-    )
-    print("status, error: ", (status, error))
-    exit()
-    return starting_puzzle, singleton_eve_coin_spend, delegated_puzzle
+    # status, error = await make_and_send_spend_bundle(
+    #     sim, sim_client, eve_coin, delegated_puzzle, [singleton_eve_coin_spend], is_eligible_for_ff
+    # )
+    # print("status, error: ", (status, error))
+    # assert False
+    return inner_puzzle, singleton_eve_coin_spend, delegated_puzzle
 
 
 @pytest.mark.asyncio
@@ -375,7 +377,7 @@ async def test_singleton_fast_forward_different_block(is_eligible_for_ff: bool) 
     # We're incrementing the next iteration's amount for testing purposes
     SINGLETON_CHILD_AMOUNT = uint64(1339)
     async with sim_and_client() as (sim, sim_client):
-        starting_puzzle, singleton_eve_coin_spend, delegated_puzzle = await prepare_singleton_eve(
+        inner_puzzle, singleton_eve_coin_spend, delegated_puzzle = await prepare_singleton_eve(
             sim, sim_client, is_eligible_for_ff, START_AMOUNT, SINGLETON_AMOUNT
         )
         singleton_puzzle_hash = singleton_eve_coin_spend.coin.puzzle_hash
@@ -407,10 +409,10 @@ async def test_singleton_fast_forward_different_block(is_eligible_for_ff: bool) 
         # Let's spend this first version, to create a bigger singleton child
         inner_conditions = [
             [ConditionOpcode.AGG_SIG_UNSAFE, G1Element(), IDENTITY_PUZZLE_HASH],
-            [ConditionOpcode.CREATE_COIN, starting_puzzle.get_tree_hash(), SINGLETON_CHILD_AMOUNT],
+            [ConditionOpcode.CREATE_COIN, inner_puzzle.get_tree_hash(), SINGLETON_CHILD_AMOUNT],
         ]
         singleton_coin_spend = make_singleton_coin_spend(
-            singleton_eve_coin_spend, singleton, starting_puzzle, inner_conditions
+            singleton_eve_coin_spend, singleton, inner_puzzle, inner_conditions
         )
         # Spend also a remaining coin for balance, as we're increasing the singleton amount
         diff_to_balance = SINGLETON_CHILD_AMOUNT - SINGLETON_AMOUNT
@@ -430,6 +432,7 @@ async def test_singleton_fast_forward_different_block(is_eligible_for_ff: bool) 
         unspent_lineage_ids = await sim_client.service.coin_store.get_unspent_lineage_ids_for_puzzle_hash(
             singleton_puzzle_hash
         )
+        print("unspent_lineage_ids: ", unspent_lineage_ids)
         singleton_child, [remaining_coin] = await get_singleton_and_remaining_coins(sim)
         print("remaining_coin.amount: ", remaining_coin.amount)
         print("singleton_child.amount: ", singleton_child.amount)
@@ -759,12 +762,13 @@ async def test_singleton_fast_forward(is_eligible_for_ff: bool) -> None:
 
 async def create_singleton_eve(
     sim: SpendSim, sim_client: SimClient, is_eligible_for_ff: bool
-) -> Tuple[CoinSpend, Program, bytes32]:
+) -> Tuple[Program, CoinSpend]:
     # Generate starting info
     key_lookup = KeyTool()
     pk = G1Element.from_bytes(public_key_for_index(1, key_lookup))
     starting_puzzle = p2_delegated_puzzle_or_hidden_puzzle.puzzle_for_pk(pk)
     if is_eligible_for_ff:
+        # This program allows us to control conditions through solutions
         inner_puzzle = Program.to(13)
     else:
         inner_puzzle = starting_puzzle
@@ -793,33 +797,37 @@ async def create_singleton_eve(
     )
     # Eve coin
     eve_coin = (await sim.all_non_reward_coins())[0]
-    singleton_puzzle_hash = eve_coin.puzzle_hash
-    launcher_coin = singleton_top_layer.generate_launcher_coin(starting_coin, START_AMOUNT)
-    launcher_id = launcher_coin.name()
-    # This delegated puzzle just recreates the coin exactly
-    delegated_puzzle = Program.to((1, [[ConditionOpcode.CREATE_COIN, inner_puzzle_hash, eve_coin.amount]]))
-    inner_solution = Program.to([[], delegated_puzzle, []])
-    # Generate the lineage proof we will need from the launcher coin
-    lineage_proof = singleton_top_layer.lineage_proof_for_coinsol(launcher_coin_spend)
-    puzzle_reveal = singleton_top_layer.puzzle_for_singleton(launcher_id, inner_puzzle)
-    full_solution = singleton_top_layer.solution_for_singleton(lineage_proof, uint64(eve_coin.amount), inner_solution)
-    singleton_eve_coin_spend = CoinSpend(eve_coin, puzzle_reveal, full_solution)
-    return singleton_eve_coin_spend, delegated_puzzle, singleton_puzzle_hash
+    singleton_eve_coin_spend, delegated_puzzle = make_singleton_coin_spend(
+        parent_coin_spend=launcher_coin_spend,
+        coin_to_spend=eve_coin,
+        inner_puzzle=inner_puzzle,
+        inner_conditions=[[ConditionOpcode.CREATE_COIN, inner_puzzle_hash, eve_coin.amount - 2]],
+        is_eve_spend=True,
+    )
+    return starting_puzzle, singleton_eve_coin_spend
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_eligible_for_ff", [True, False])
 async def test_foo(is_eligible_for_ff: bool) -> None:
     async with sim_and_client() as (sim, sim_client):
-        singleton_eve_coin_spend, delegated_puzzle, singleton_puzzle_hash = await create_singleton_eve(
-            sim, sim_client, is_eligible_for_ff
-        )
+        starting_puzzle, singleton_eve_coin_spend = await create_singleton_eve(sim, sim_client, is_eligible_for_ff)
+        if is_eligible_for_ff:
+            # This program allows us to control conditions through solutions
+            inner_puzzle = Program.to(13)
+        else:
+            inner_puzzle = starting_puzzle
+        inner_puzzle_hash = inner_puzzle.get_tree_hash()
         # At this point we don't have any unspent singleton
+        singleton_puzzle_hash = singleton_eve_coin_spend.coin.puzzle_hash
         unspent_lineage_ids = await sim_client.service.coin_store.get_unspent_lineage_ids_for_puzzle_hash(
             singleton_puzzle_hash
         )
         assert unspent_lineage_ids is None
         singleton_eve = singleton_eve_coin_spend.coin
+        delegated_puzzle = Program.to(
+            (1, [[ConditionOpcode.CREATE_COIN, inner_puzzle_hash, singleton_eve_coin_spend.coin.amount - 2]])
+        )
         await make_and_send_spend_bundle(
             sim, sim_client, singleton_eve, delegated_puzzle, [singleton_eve_coin_spend], is_eligible_for_ff
         )
@@ -836,14 +844,14 @@ async def test_foo(is_eligible_for_ff: bool) -> None:
             parent_parent_id=singleton_eve.parent_coin_info,
         )
         # Let's spend this first version, to create singleton child
-        # Same delegated_puzzle/inner_solution as we're just recreating ourselves here
-        lineage_proof = singleton_top_layer.lineage_proof_for_coinsol(singleton_eve_coin_spend)
-        inner_solution = Program.to([[], delegated_puzzle, []])
-        full_solution = singleton_top_layer.solution_for_singleton(
-            lineage_proof, uint64(singleton.amount), inner_solution
+        singleton_coin_spend, delegated_puzzle = make_singleton_coin_spend(
+            parent_coin_spend=singleton_eve_coin_spend,
+            coin_to_spend=singleton,
+            inner_puzzle=inner_puzzle,
+            inner_conditions=[
+                [ConditionOpcode.CREATE_COIN, inner_puzzle_hash, singleton_eve_coin_spend.coin.amount - 4]
+            ],
         )
-        # Same puzzle reveal too
-        singleton_coin_spend = CoinSpend(singleton, singleton_eve_coin_spend.puzzle_reveal, full_solution)
         # We spend the singleton and get its child as the most recent unspent
         await make_and_send_spend_bundle(
             sim, sim_client, singleton, delegated_puzzle, [singleton_coin_spend], is_eligible_for_ff
@@ -880,6 +888,7 @@ async def test_foo(is_eligible_for_ff: bool) -> None:
                 parent_amount=singleton_grandchild.amount,
                 parent_parent_id=singleton.name(),
             )
+            print("done testing this path")
         else:
             # As this singleton is not eligible for fast forward, attempting to
             # spend one of its earlier versions is considered a double spend

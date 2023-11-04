@@ -401,8 +401,8 @@ class Mempool:
             if not item_inclusion_filter(name):
                 continue
             try:
-                print("************ going through item: ", name.hex())
-                print("FPC: ", fpc)
+                # print("************ going through item: ", name.hex())
+                # print("FPC: ", fpc)
                 await eligible_coin_spends.process_fast_forward_spends(
                     mempool_item=item,
                     get_unspent_lineage_ids_for_puzzle_hash=get_unspent_lineage_ids_for_puzzle_hash,
@@ -430,15 +430,15 @@ class Mempool:
                 log.debug(f"Exception while checking a mempool item for deduplication: {e}")
                 continue
         if processed_spend_bundles == 0:
-            print("we didn't process any items?")
+            # print("we didn't process any items?")
             return None
-        print("creating bundle with items: ", processed_spend_bundles)
+        # print("creating bundle with items: ", processed_spend_bundles)
         log.info(
             f"Cumulative cost of block (real cost should be less) {cost_sum}. Proportion "
             f"full: {cost_sum / self.mempool_info.max_block_clvm_cost}"
         )
         aggregated_signature = AugSchemeMPL.aggregate(sigs)
-        print("additions: ", [x.name().hex() for x in additions])
-        print("coin_spends: ", coin_spends[0].coin.name().hex())
+        # print("additions: ", [x.name().hex() for x in additions])
+        # print("coin_spends: ", coin_spends[0].coin.name().hex())
         agg = SpendBundle(coin_spends, aggregated_signature)
         return agg, additions

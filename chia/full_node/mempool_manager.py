@@ -419,6 +419,11 @@ class MempoolManager:
             if not is_eligible_for_dedup:
                 non_eligible_coin_ids.append(coin_id)
             is_eligible_for_ff = bool(spend.flags & ELIGIBLE_FOR_FF)
+            if not is_eligible_for_ff:
+                print("********************* this coin is not eligible: ", coin_id.hex())
+            else:
+                print("********************* this coin is eligible: ", coin_id.hex())
+            print("conditions: ", npc_result.conds)
             eligibility_and_additions[coin_id] = (is_eligible_for_dedup, spend_additions, is_eligible_for_ff)
         removal_names_from_coin_spends: Set[bytes32] = set()
         fast_forward_coin_ids: Set[bytes32] = set()
@@ -569,7 +574,7 @@ class MempoolManager:
         removals: Dict[bytes32, CoinRecord],
         fast_forward_coin_ids: Set[bytes32],
     ) -> Tuple[Optional[Err], List[MempoolItem]]:
-        print("inside check_removals")
+        # print("inside check_removals")
         """
         This function checks for double spends, unknown spends and conflicting transactions in mempool.
         Returns Error (if any), the set of existing MempoolItems with conflicting spends (if any).
@@ -582,17 +587,17 @@ class MempoolManager:
             if record.spent:
                 # Only consider it a double spend if this is not a fast forward
                 if record.name not in fast_forward_coin_ids:
-                    print("fast_forward_coin_ids: ", [x.hex() for x in fast_forward_coin_ids])
-                    print("record.name: ", record.name.hex())
+                    # print("fast_forward_coin_ids: ", [x.hex() for x in fast_forward_coin_ids])
+                    # print("record.name: ", record.name.hex())
                     return Err.DOUBLE_SPEND, []
-                else:
-                    print("we're letting this ff coin in")
+                # else:
+                    # print("we're letting this ff coin in")
         # 2. Checks if there's a mempool conflict
         # Only consider conflicts if the coin is not eligible for deduplication
         # or singleton fast forwarding
         coin_ids = [i for i in non_eligible_coin_ids if i not in fast_forward_coin_ids]
         conflicts = self.mempool.get_items_by_coin_ids(coin_ids)
-        print("conflicts: ", [x.name.hex() for x in conflicts])
+        # print("conflicts: ", [x.name.hex() for x in conflicts])
         if len(conflicts) > 0:
             return Err.MEMPOOL_CONFLICT, conflicts
         # 5. If coins can be spent return list of unspents as we see them in local storage
@@ -653,8 +658,8 @@ class MempoolManager:
         self.peak = new_peak
 
         if use_optimization and last_npc_result is not None:
-            print("**** entering OPTIMIZED path")
-            print("last_npc_result.conds: ", last_npc_result.conds)
+            # print("**** entering OPTIMIZED path")
+            # print("last_npc_result.conds: ", last_npc_result.conds)
             # We don't reinitialize a mempool, just kick removed items
             if last_npc_result.conds is not None:
                 # transactions in the mempool may be spending multiple coins,
@@ -668,10 +673,10 @@ class MempoolManager:
                         included_items.append(MempoolItemInfo(item.cost, item.fee, item.height_added_to_mempool))
                         self.remove_seen(item.name)
                         spendbundle_ids_to_remove.add(item.name)
-                print("spendbundle_ids_to_remove: ", len(spendbundle_ids_to_remove))
+                # print("spendbundle_ids_to_remove: ", len(spendbundle_ids_to_remove))
                 self.mempool.remove_from_pool(list(spendbundle_ids_to_remove), MempoolRemoveReason.BLOCK_INCLUSION)
         else:
-            print("*** entering REORG (non optimized) path")
+            # print("*** entering REORG (non optimized) path")
             old_pool = self.mempool
             self.mempool = Mempool(old_pool.mempool_info, old_pool.fee_estimator)
             self.seen_bundle_hashes = {}
