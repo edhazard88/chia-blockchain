@@ -311,7 +311,7 @@ def make_singleton_coin_spend(
 
 async def prepare_singleton_eve(
     sim: SpendSim, sim_client: SimClient, is_eligible_for_ff: bool, start_amount: uint64, singleton_amount: uint64
-) -> Tuple[Program, CoinSpend, Program]:
+) -> Tuple[Program, CoinSpend]:
     # Generate starting info
     key_lookup = KeyTool()
     pk = G1Element.from_bytes(public_key_for_index(1, key_lookup))
@@ -342,11 +342,11 @@ async def prepare_singleton_eve(
     await make_and_send_spend_bundle(
         sim,
         sim_client,
-        starting_coin,
-        delegated_puzzle,
         [starting_coin_spend, launcher_coin_spend],
         is_eligible_for_ff,
         is_launcher_coin=True,
+        signing_puzzle=delegated_puzzle,
+        signing_coin=starting_coin,
     )
     # Eve coin
     eve_coin, _ = await get_singleton_and_remaining_coins(sim)
@@ -354,20 +354,19 @@ async def prepare_singleton_eve(
     # print("remaining_coin amount: ", remaining_coin.amount)
     print("eve_coin.amount: ", eve_coin.amount)
     inner_conditions = [[ConditionOpcode.CREATE_COIN, inner_puzzle_hash, singleton_amount]]
-    singleton_eve_coin_spend = make_singleton_coin_spend(
+    eve_coin_spend, eve_signing_puzzle = make_singleton_coin_spend(
         parent_coin_spend=launcher_coin_spend,
         coin_to_spend=eve_coin,
         inner_puzzle=inner_puzzle,
         inner_conditions=inner_conditions,
         is_eve_spend=True,
-        is_eligible_for_ff=is_eligible_for_ff,
     )
     # status, error = await make_and_send_spend_bundle(
-    #     sim, sim_client, eve_coin, delegated_puzzle, [singleton_eve_coin_spend], is_eligible_for_ff
+    #     sim, sim_client, eve_coin, delegated_puzzle, [eve_coin_spend], is_eligible_for_ff
     # )
     # print("status, error: ", (status, error))
     # assert False
-    return inner_puzzle, singleton_eve_coin_spend, delegated_puzzle
+    return inner_puzzle, eve_coin_spend, eve_signing_puzzle
 
 
 @pytest.mark.asyncio
@@ -379,19 +378,26 @@ async def test_singleton_fast_forward_different_block(is_eligible_for_ff: bool) 
     # We're incrementing the next iteration's amount for testing purposes
     SINGLETON_CHILD_AMOUNT = uint64(1339)
     async with sim_and_client() as (sim, sim_client):
-        inner_puzzle, singleton_eve_coin_spend, delegated_puzzle = await prepare_singleton_eve(
+        inner_puzzle, eve_coin_spend, eve_signing_puzzle = await prepare_singleton_eve(
             sim, sim_client, is_eligible_for_ff, START_AMOUNT, SINGLETON_AMOUNT
         )
-        singleton_puzzle_hash = singleton_eve_coin_spend.coin.puzzle_hash
+        inner_puzzle_hash = inner_puzzle.get_tree_hash()
         # At this point we don't have any unspent singleton
+        singleton_puzzle_hash = eve_coin_spend.coin.puzzle_hash
         unspent_lineage_ids = await sim_client.service.coin_store.get_unspent_lineage_ids_for_puzzle_hash(
             singleton_puzzle_hash
         )
         assert unspent_lineage_ids is None
-        singleton_eve = singleton_eve_coin_spend.coin
+        eve_coin = eve_coin_spend.coin
+        # delegated_puzzle = Program.to((1, [[ConditionOpcode.CREATE_COIN, inner_puzzle_hash, SINGLETON_AMOUNT]]))
         print("foo")
         await make_and_send_spend_bundle(
-            sim, sim_client, singleton_eve, delegated_puzzle, [singleton_eve_coin_spend], is_eligible_for_ff
+            sim,
+            sim_client,
+            [eve_coin_spend],
+            is_eligible_for_ff,
+            signing_puzzle=eve_signing_puzzle,
+            signing_coin=eve_coin,
         )
         print("bar")
         # Now we spent eve and we have an unspent singleton that we can test with
@@ -404,17 +410,17 @@ async def test_singleton_fast_forward_different_block(is_eligible_for_ff: bool) 
         assert unspent_lineage_ids == UnspentLineageIds(
             coin_id=singleton.name(),
             coin_amount=singleton.amount,
-            parent_id=singleton_eve.name(),
-            parent_amount=singleton_eve.amount,
-            parent_parent_id=singleton_eve.parent_coin_info,
+            parent_id=eve_coin.name(),
+            parent_amount=eve_coin.amount,
+            parent_parent_id=eve_coin.parent_coin_info,
         )
         # Let's spend this first version, to create a bigger singleton child
         inner_conditions = [
             [ConditionOpcode.AGG_SIG_UNSAFE, G1Element(), IDENTITY_PUZZLE_HASH],
             [ConditionOpcode.CREATE_COIN, inner_puzzle.get_tree_hash(), SINGLETON_CHILD_AMOUNT],
         ]
-        singleton_coin_spend = make_singleton_coin_spend(
-            singleton_eve_coin_spend, singleton, inner_puzzle, inner_conditions
+        singleton_coin_spend, singleton_signing_puzzle = make_singleton_coin_spend(
+            eve_coin_spend, singleton, inner_puzzle, inner_conditions
         )
         # Spend also a remaining coin for balance, as we're increasing the singleton amount
         diff_to_balance = SINGLETON_CHILD_AMOUNT - SINGLETON_AMOUNT
@@ -425,10 +431,10 @@ async def test_singleton_fast_forward_different_block(is_eligible_for_ff: bool) 
         status, error = await make_and_send_spend_bundle(
             sim,
             sim_client,
-            singleton,
-            delegated_puzzle,
             [remaining_coin_spend, singleton_coin_spend],
             is_eligible_for_ff,
+            signing_puzzle=singleton_signing_puzzle,
+            signing_coin=singleton,
         )
         print("status, error: ", (status, error))
         unspent_lineage_ids = await sim_client.service.coin_store.get_unspent_lineage_ids_for_puzzle_hash(
@@ -444,7 +450,7 @@ async def test_singleton_fast_forward_different_block(is_eligible_for_ff: bool) 
             coin_amount=singleton_child.amount,
             parent_id=singleton.name(),
             parent_amount=singleton.amount,
-            parent_parent_id=singleton_eve.name(),
+            parent_parent_id=eve_coin.name(),
         )
         # Now let's spend the first version again (despite being already spent by now)
         remaining_coin_spend = CoinSpend(
@@ -455,10 +461,10 @@ async def test_singleton_fast_forward_different_block(is_eligible_for_ff: bool) 
         status, error = await make_and_send_spend_bundle(
             sim,
             sim_client,
-            singleton,
-            delegated_puzzle,
             [remaining_coin_spend, singleton_coin_spend],
             is_eligible_for_ff,
+            signing_puzzle=singleton_signing_puzzle,
+            signing_coin=singleton,
         )
         if is_eligible_for_ff:
             # Instead of rejecting this as double spend, we perform a fast forward,
@@ -481,7 +487,7 @@ async def test_singleton_fast_forward_different_block(is_eligible_for_ff: bool) 
                 parent_parent_id=singleton.name(),
             )
             print("-- Coin IDs:")
-            print("eve: ", singleton_eve.name().hex())
+            print("eve: ", eve_coin.name().hex())
             print("singleton: ", singleton.name().hex())
             print("singleton_child: ", singleton_child.name().hex())
             print("singleton_grandchild: ", singleton_grandchild.name().hex())
