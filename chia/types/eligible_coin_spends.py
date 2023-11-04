@@ -135,7 +135,7 @@ def perform_the_fast_forward(
     print("parent_parent_coin_info: ", parent_parent_coin_info.hex())
     print("new_my_amount: ", int_from_bytes(new_my_amount))
     _, delegated_puzzle, _ = new_inner_solution
-    print("delegated_puzzle: ", delegated_puzzle)
+    # print("delegated_puzzle: ", delegated_puzzle)
 
     print("NEW SOLUTION DATA ==============")
     # print("new_solution: ", new_solution)
@@ -148,7 +148,7 @@ def perform_the_fast_forward(
     print("parent_parent_coin_info: ", parent_parent_coin_info.hex())
     print("new_my_amount: ", int_from_bytes(new_my_amount))
     _, delegated_puzzle, _ = new_inner_solution
-    print("delegated_puzzle: ", delegated_puzzle)
+    # print("delegated_puzzle: ", delegated_puzzle)
     # ffffa030d940e53ed5b56fee3ae46ba5f4e59da5e2cc9242f6e482fe1f1e4d9a463639
     # ffa0c7b89cfb9abf2c4cb212a4840b37d762f4c880b8517b0dadb0c310ded24dd86dff82053980ff820539ffff80ffff01ffff31ffb0
     # c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffa09dcf97a1
