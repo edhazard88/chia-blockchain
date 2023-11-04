@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import dataclasses
 from typing import Any, Dict, List, Optional, Tuple
-from more_itertools import partition
 
 import pytest
 from blspy import AugSchemeMPL, G1Element, G2Element, PrivateKey
+from more_itertools import partition
 
 from chia.clvm.spend_sim import SimClient, SpendSim, sim_and_client
 from chia.consensus.default_constants import DEFAULT_CONSTANTS
@@ -259,7 +259,6 @@ async def make_and_send_spend_bundle(
     coin_spends: List[CoinSpend],
     is_eligible_for_ff: bool = True,
     is_launcher_coin: bool = False,
-    farm_afterwards: bool = True,
     signing_puzzle: Optional[Program] = None,
     signing_coin: Optional[Coin] = None,
 ) -> Tuple[MempoolInclusionStatus, Optional[Err]]:
@@ -271,7 +270,7 @@ async def make_and_send_spend_bundle(
         signature = G2Element()
     spend_bundle = SpendBundle(coin_spends, signature)
     status, error = await sim_client.push_tx(spend_bundle)
-    if error is None and farm_afterwards:
+    if error is None:
         await sim.farm_block()
     return status, error
 
@@ -307,7 +306,7 @@ def make_singleton_coin_spend(
 
 async def prepare_singleton_eve(
     sim: SpendSim, sim_client: SimClient, is_eligible_for_ff: bool, start_amount: uint64, singleton_amount: uint64
-) -> Tuple[Program, CoinSpend]:
+) -> Tuple[Program, CoinSpend, Program]:
     # Generate starting info
     key_lookup = KeyTool()
     pk = G1Element.from_bytes(public_key_for_index(1, key_lookup))
@@ -525,15 +524,12 @@ async def test_singleton_fast_forward_same_block() -> None:
             parent_amount=singleton.amount,
             parent_parent_id=eve_coin.name(),
         )
-        # Now let's test this same block scenario:
-        # 1) Generate like 5 spend bundles that all spend the singleton and output a new singleton with a unique amount, and light an XCH coin with a large amount on fire
-        # 2) Shuffle them (or test every combination) and send them to the mempool
-        # 3) Examine the history and make sure the coin amounts went in the order that the spend bundles you submitted implies
-
+        # Now let's send 3 arbitrary spends of the already spent singleton in
+        # one block. They should all properly fast forward
         random_amounts = [21, 17, 11]
         signature = G2Element()
         for i in range(3):
-            # This allows us to maintain the order of spend as their fee per
+            # This allows us to maintain the order of spends as their fee per
             # cost gets smaller due to their amounts
             cost_factor = (i + 1) * 5
             inner_conditions = [
@@ -554,276 +550,13 @@ async def test_singleton_fast_forward_same_block() -> None:
         )
         latest_singleton, [remaining_coin] = await get_singleton_and_remaining_coins(sim)
         assert unspent_lineage_ids is not None
+        # The unspent coin ID should reflect the latest version
         assert unspent_lineage_ids.coin_id == latest_singleton.name()
+        # The latest version should have the last random amount
         assert latest_singleton.amount == random_amounts[-1]
+        # The unspent coin amount should reflect the latest version
         assert unspent_lineage_ids.coin_amount == latest_singleton.amount
+        # The unspent parent ID should reflect the latest version's parent
         assert unspent_lineage_ids.parent_id == latest_singleton.parent_coin_info
+        # The one before it should have the second last random amount
         assert unspent_lineage_ids.parent_amount == random_amounts[-2]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("is_eligible_for_ff", [True, False])
-async def test_singleton_fast_forward(is_eligible_for_ff: bool) -> None:
-    START_AMOUNT = uint64(1337)
-    # We're decrementing the next iteration's amount for testing purposes
-    SINGLETON_AMOUNT = uint64(1335)
-    # We're incrementing the next iteration's amount for testing purposes
-    async with sim_and_client() as (sim, sim_client):
-        starting_puzzle, singleton_eve_coin_spend, delegated_puzzle = await prepare_singleton_eve(
-            sim, sim_client, is_eligible_for_ff, START_AMOUNT, SINGLETON_AMOUNT
-        )
-        singleton_puzzle_hash = singleton_eve_coin_spend.coin.puzzle_hash
-        # At this point we don't have any unspent singleton
-        unspent_lineage_ids = await sim_client.service.coin_store.get_unspent_lineage_ids_for_puzzle_hash(
-            singleton_puzzle_hash
-        )
-        assert unspent_lineage_ids is None
-        singleton_eve = singleton_eve_coin_spend.coin
-        await make_and_send_spend_bundle(
-            sim, sim_client, singleton_eve, delegated_puzzle, [singleton_eve_coin_spend], is_eligible_for_ff
-        )
-        # Now we spent eve and we have an unspent singleton that we can test with
-        singleton, [remaining_coin] = await get_singleton_and_remaining_coins(sim)
-        unspent_lineage_ids = await sim_client.service.coin_store.get_unspent_lineage_ids_for_puzzle_hash(
-            singleton_puzzle_hash
-        )
-        assert singleton.amount == SINGLETON_AMOUNT
-        assert unspent_lineage_ids == UnspentLineageIds(
-            coin_id=singleton.name(),
-            coin_amount=singleton.amount,
-            parent_id=singleton_eve.name(),
-            parent_amount=singleton_eve.amount,
-            parent_parent_id=singleton_eve.parent_coin_info,
-        )
-        # Let's spend this first version, to create singleton child
-        # Same delegated_puzzle/inner_solution as we're just recreating ourselves here
-        lineage_proof = singleton_top_layer.lineage_proof_for_coinsol(singleton_eve_coin_spend)
-
-        delegated_puzzle2 = Program.to(
-            (
-                1,
-                [
-                    [ConditionOpcode.AGG_SIG_UNSAFE, G1Element(), IDENTITY_PUZZLE_HASH],
-                    [ConditionOpcode.CREATE_COIN, starting_puzzle.get_tree_hash(), 1339],
-                ],
-            )
-        )
-        inner_solution2 = Program.to([[], delegated_puzzle2, []])
-        solution2 = singleton_top_layer.solution_for_singleton(lineage_proof, uint64(singleton.amount), inner_solution2)
-
-        # inner_solution = Program.to([[], delegated_puzzle, []])
-        # full_solution = singleton_top_layer.solution_for_singleton(
-        #     lineage_proof, uint64(singleton.amount), inner_solution
-        # )
-        # Same puzzle reveal too
-        # singleton_coin_spend = CoinSpend(singleton, singleton_eve_coin_spend.puzzle_reveal, full_solution)
-        singleton_coin_spend = CoinSpend(singleton, singleton_eve_coin_spend.puzzle_reveal, solution2)
-        remaining_coin_spend = CoinSpend(
-            remaining_coin,
-            IDENTITY_PUZZLE,
-            Program.to([[ConditionOpcode.CREATE_COIN, IDENTITY_PUZZLE_HASH, remaining_coin.amount - 10000]]),
-        )
-        # print("full_solution: ", full_solution)
-
-        # ===============================================================
-
-        # 1) Generate like 5 spend bundles that all spend the singleton and output a new singleton with a unique amount, and light an XCH coin with a large amount on fire
-        # 2) Shuffle them (or test every combination) and send them to the mempool
-        # 3) Examine the history and make sure the coin amounts went in the order that the spend bundles you submitted implies
-        # inner_puzzle_hash = Program.to(13).get_tree_hash()
-        # delegated_puzzle1 = Program.to(
-        #     (
-        #         1,
-        #         [
-        #             [ConditionOpcode.AGG_SIG_UNSAFE, G1Element(), IDENTITY_PUZZLE_HASH],
-        #             [ConditionOpcode.CREATE_COIN, inner_puzzle_hash, 1335],
-        #         ],
-        #     )
-        # )
-        # inner_solution1 = Program.to([[], delegated_puzzle1, []])
-        # solution1 = singleton_top_layer.solution_for_singleton(lineage_proof, uint64(singleton.amount), inner_solution1)
-        # spend1 = CoinSpend(singleton, singleton_eve_coin_spend.puzzle_reveal, solution1)
-        # delegated_puzzle2 = Program.to(
-        #     (
-        #         1,
-        #         [
-        #             [ConditionOpcode.AGG_SIG_UNSAFE, G1Element(), IDENTITY_PUZZLE_HASH],
-        #             [ConditionOpcode.CREATE_COIN, inner_puzzle_hash, 1333],
-        #         ],
-        #     )
-        # )
-        # inner_solution2 = Program.to([[], delegated_puzzle2, []])
-        # solution2 = singleton_top_layer.solution_for_singleton(lineage_proof, uint64(singleton.amount), inner_solution2)
-        # spend2 = CoinSpend(singleton, singleton_eve_coin_spend.puzzle_reveal, solution2)
-        # # We spend the singleton and get its child as the most recent unspent
-        # print("mempool items before sending spend1: ", len(list(sim.mempool_manager.mempool.all_items())))
-        # status, error = await make_and_send_spend_bundle(
-        #     sim, sim_client, singleton, delegated_puzzle1, [spend1], is_eligible_for_ff, farm_afterwards=False
-        # )
-        # print("status, error: ", (status, error))
-        # print("mempool items before farming spend1: ", len(list(sim.mempool_manager.mempool.all_items())))
-        # print("farming after spend1")
-        # await sim.farm_block()
-        # print("done farming spend1")
-        # print("mempool items after farming spend1: ", len(list(sim.mempool_manager.mempool.all_items())))
-        # # print([x.name.hex() for x in sim.mempool_manager.mempool.all_items()])
-        # singleton_child = (await sim.all_non_reward_coins())[0]
-        # print("singleton_child: ", singleton_child.name().hex())
-        # print("singleton_child.amount: ", singleton_child.amount)
-        # status, error = await make_and_send_spend_bundle(
-        #     sim, sim_client, singleton, delegated_puzzle1, [spend2], is_eligible_for_ff, farm_afterwards=False
-        # )
-        # print("status, error: ", (status, error))
-        # print("mempool items before farming spend2: ", len(list(sim.mempool_manager.mempool.all_items())))
-        # print("farming after spend2")
-        # await sim.farm_block()
-        # print("done farming spend2")
-        # print("mempool items after farming spend2: ", len(list(sim.mempool_manager.mempool.all_items())))
-        # unspent_lineage_ids = await sim_client.service.coin_store.get_unspent_lineage_ids_for_puzzle_hash(
-        #     singleton_puzzle_hash
-        # )
-        # singleton_grandchild = (await sim.all_non_reward_coins())[0]
-        # print("singleton_grandchild: ", singleton_grandchild.name().hex())
-        # print("singleton_grandchild.amount: ", singleton_grandchild.amount)
-        # assert unspent_lineage_ids == UnspentLineageIds(
-        #     coin_id=singleton_grandchild.name(),
-        #     coin_amount=singleton_grandchild.amount,
-        #     parent_id=singleton_child.name(),
-        #     parent_amount=singleton_child.amount,
-        #     parent_parent_id=singleton_child.parent_coin_info,
-        # )
-        # return
-
-        # ===============================================================
-
-        status, error = await make_and_send_spend_bundle(
-            sim,
-            sim_client,
-            singleton,
-            delegated_puzzle,
-            [remaining_coin_spend, singleton_coin_spend],
-            is_eligible_for_ff,
-        )
-        print("status, error: ", (status, error))
-        unspent_lineage_ids = await sim_client.service.coin_store.get_unspent_lineage_ids_for_puzzle_hash(
-            singleton_puzzle_hash
-        )
-        singleton_child, [remaining_coin] = await get_singleton_and_remaining_coins(sim)
-        print("remaining_coin.amount: ", remaining_coin.amount)
-        print("singleton_child.amount: ", singleton_child.amount)
-        assert unspent_lineage_ids == UnspentLineageIds(
-            coin_id=singleton_child.name(),
-            coin_amount=singleton_child.amount,
-            parent_id=singleton.name(),
-            parent_amount=singleton.amount,
-            parent_parent_id=singleton_eve.name(),
-        )
-        # Now let's spend the first version again (despite being already spent by now)
-        remaining_coin_spend = CoinSpend(
-            remaining_coin,
-            IDENTITY_PUZZLE,
-            Program.to([[ConditionOpcode.CREATE_COIN, IDENTITY_PUZZLE_HASH, remaining_coin.amount - 10000]]),
-        )
-        status, error = await make_and_send_spend_bundle(
-            sim,
-            sim_client,
-            singleton,
-            delegated_puzzle,
-            [remaining_coin_spend, singleton_coin_spend],
-            is_eligible_for_ff,
-        )
-        if is_eligible_for_ff:
-            # Instead of rejecting this as double spend, we perform a fast forward,
-            # spending the singleton child as a result, and creating the latest
-            # version which is the grandchild in this scenario
-            assert status == MempoolInclusionStatus.SUCCESS
-            assert error is None
-            unspent_lineage_ids = await sim_client.service.coin_store.get_unspent_lineage_ids_for_puzzle_hash(
-                singleton_puzzle_hash
-            )
-            singleton_grandchild, [remaining_coin] = await get_singleton_and_remaining_coins(sim)
-            print("remaining_coin amount: ", remaining_coin.amount)
-            print("singleton_grandchild amount: ", singleton_grandchild.amount)
-            print("singleton_child.amount: ", singleton_child.amount)
-            assert unspent_lineage_ids == UnspentLineageIds(
-                coin_id=singleton_grandchild.name(),
-                coin_amount=singleton_grandchild.amount,
-                parent_id=singleton_child.name(),
-                parent_amount=singleton_child.amount,
-                parent_parent_id=singleton.name(),
-            )
-            print("-- Coin IDs:")
-            print("eve: ", singleton_eve.name().hex())
-            print("singleton: ", singleton.name().hex())
-            print("singleton_child: ", singleton_child.name().hex())
-            print("singleton_grandchild: ", singleton_grandchild.name().hex())
-            print("###### Now let's go further: ######")
-            # Now let's go further:
-            # 1) Generate like 5 spend bundles that all spend the singleton and output a new singleton with a unique amount, and light an XCH coin with a large amount on fire
-            # 2) Shuffle them (or test every combination) and send them to the mempool
-            # 3) Examine the history and make sure the coin amounts went in the order that the spend bundles you submitted implies
-            remaining_coin_spend = CoinSpend(
-                remaining_coin,
-                IDENTITY_PUZZLE,
-                Program.to([[ConditionOpcode.CREATE_COIN, IDENTITY_PUZZLE_HASH, remaining_coin.amount - 10000]]),
-            )
-            random_amounts = [21, 17, 11]
-            # coin_spends = []
-            signature = G2Element()
-            remaining_coin_sb = SpendBundle([remaining_coin_spend], signature)
-            for i in range(3):
-                # this allows us to maintain the order of spend as their fee per
-                # cost gets smaller due to their amounts
-                cost_factor = (i + 1) * 5
-                conditions = [
-                    [ConditionOpcode.AGG_SIG_UNSAFE, G1Element(), IDENTITY_PUZZLE_HASH] for _ in range(cost_factor)
-                ]
-                conditions.append([ConditionOpcode.CREATE_COIN, starting_puzzle.get_tree_hash(), random_amounts[i]])
-                delegated_puzzle = Program.to((1, conditions))
-                inner_solution = Program.to([[], delegated_puzzle, []])
-                solution = singleton_top_layer.solution_for_singleton(
-                    lineage_proof, uint64(singleton.amount), inner_solution
-                )
-                singleton_coin_spend = CoinSpend(singleton, singleton_eve_coin_spend.puzzle_reveal, solution)
-                print("about to call push tx on item ")
-                coin_spends = [singleton_coin_spend]
-                # if i == 1:
-                #     coin_spends.append(remaining_coin_spend)
-                sb = SpendBundle(coin_spends, signature)
-                status, error = await sim_client.push_tx(sb)
-                print("status, error: ", (status, error))
-                print("item ", i, " has amount ", random_amounts[i], " and id ", sb.name().hex())
-                # coin_spends.append(singleton_coin_spend)
-            # coin_spends.append(remaining_coin_spend)
-            # coin_spends_sb = SpendBundle(coin_spends, signature)
-            # sb = SpendBundle.aggregate([coin_spends_sb, remaining_coin_sb])
-            # print("about to call push tx on remaining")
-            # status, error = await sim_client.push_tx(remaining_coin_sb)
-            # status, error = await make_and_send_spend_bundle(
-            #     sim, sim_client, singleton, delegated_puzzle, coin_spends, is_eligible_for_ff, farm_afterwards=False
-            # )
-            # print("status, error: ", (status, error))
-            print("=========== now we farm ===========")
-            await sim.farm_block()
-            unspent_lineage_ids = await sim_client.service.coin_store.get_unspent_lineage_ids_for_puzzle_hash(
-                singleton_puzzle_hash
-            )
-            latest_singleton, [remaining_coin] = await get_singleton_and_remaining_coins(sim)
-            print("remaining_coin amount: ", remaining_coin.amount)
-            print("latest_singleton amount: ", latest_singleton.amount)
-            assert unspent_lineage_ids is not None
-            assert unspent_lineage_ids.coin_id == latest_singleton.name()
-            assert latest_singleton.amount == random_amounts[-1]
-            assert unspent_lineage_ids.coin_amount == latest_singleton.amount
-            assert unspent_lineage_ids.parent_id == latest_singleton.parent_coin_info
-            assert unspent_lineage_ids.parent_amount == random_amounts[-2]
-            print("-- Coin IDs:")
-            print("eve: ", singleton_eve.name().hex())
-            print("singleton: ", singleton.name().hex())
-            print("singleton_child: ", singleton_child.name().hex())
-            print("singleton_grandchild: ", singleton_grandchild.name().hex())
-        else:
-            # As this singleton is not eligible for fast forward, attempting to
-            # spend one of its earlier versions is considered a double spend
-            assert status == MempoolInclusionStatus.FAILED
-            assert error == Err.DOUBLE_SPEND

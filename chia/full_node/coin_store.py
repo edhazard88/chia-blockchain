@@ -8,10 +8,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import typing_extensions
 from aiosqlite import Cursor
+from clvm.casts import int_from_bytes
 
 from chia.protocols.wallet_protocol import CoinState
 from chia.types.blockchain_format.coin import Coin
-from clvm.casts import int_from_bytes
 from chia.types.blockchain_format.sized_bytes import bytes32
 from chia.types.coin_record import CoinRecord
 from chia.types.eligible_coin_spends import UnspentLineageIds
