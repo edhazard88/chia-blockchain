@@ -256,17 +256,19 @@ def sign_delegated_puz(del_puz: Program, coin: Coin) -> G2Element:
 async def make_and_send_spend_bundle(
     sim: SpendSim,
     sim_client: SimClient,
-    coin: Coin,
-    delegated_puzzle: Program,
     coin_spends: List[CoinSpend],
     is_eligible_for_ff: bool,
     is_launcher_coin: bool = False,
     farm_afterwards: bool = True,
+    signing_puzzle: Optional[Program] = None,
+    signing_coin: Optional[Coin] = None,
 ) -> Tuple[MempoolInclusionStatus, Optional[Err]]:
     if is_launcher_coin or not is_eligible_for_ff:
         print("is_launcher_coin: ", is_launcher_coin)
         print("is_eligible_for_ff: ", is_eligible_for_ff)
-        signature = sign_delegated_puz(delegated_puzzle, coin)
+        assert signing_puzzle is not None
+        assert signing_coin is not None
+        signature = sign_delegated_puz(signing_puzzle, signing_coin)
         print("signature: ", signature)
     else:
         signature = G2Element()
@@ -789,11 +791,11 @@ async def create_singleton_eve(
     await make_and_send_spend_bundle(
         sim,
         sim_client,
-        starting_coin,
-        delegated_puzzle,
         [starting_coin_spend, launcher_coin_spend],
         is_eligible_for_ff,
         is_launcher_coin=True,
+        signing_puzzle=delegated_puzzle,
+        signing_coin=starting_coin,
     )
     # Eve coin
     eve_coin = (await sim.all_non_reward_coins())[0]
@@ -804,32 +806,32 @@ async def create_singleton_eve(
         inner_conditions=[[ConditionOpcode.CREATE_COIN, inner_puzzle_hash, eve_coin.amount - 2]],
         is_eve_spend=True,
     )
-    return starting_puzzle, singleton_eve_coin_spend
+    return inner_puzzle, singleton_eve_coin_spend
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_eligible_for_ff", [True, False])
 async def test_foo(is_eligible_for_ff: bool) -> None:
     async with sim_and_client() as (sim, sim_client):
-        starting_puzzle, singleton_eve_coin_spend = await create_singleton_eve(sim, sim_client, is_eligible_for_ff)
-        if is_eligible_for_ff:
-            # This program allows us to control conditions through solutions
-            inner_puzzle = Program.to(13)
-        else:
-            inner_puzzle = starting_puzzle
+        inner_puzzle, eve_coin_spend = await create_singleton_eve(sim, sim_client, is_eligible_for_ff)
         inner_puzzle_hash = inner_puzzle.get_tree_hash()
         # At this point we don't have any unspent singleton
-        singleton_puzzle_hash = singleton_eve_coin_spend.coin.puzzle_hash
+        singleton_puzzle_hash = eve_coin_spend.coin.puzzle_hash
         unspent_lineage_ids = await sim_client.service.coin_store.get_unspent_lineage_ids_for_puzzle_hash(
             singleton_puzzle_hash
         )
         assert unspent_lineage_ids is None
-        singleton_eve = singleton_eve_coin_spend.coin
+        singleton_eve = eve_coin_spend.coin
         delegated_puzzle = Program.to(
-            (1, [[ConditionOpcode.CREATE_COIN, inner_puzzle_hash, singleton_eve_coin_spend.coin.amount - 2]])
+            (1, [[ConditionOpcode.CREATE_COIN, inner_puzzle_hash, eve_coin_spend.coin.amount - 2]])
         )
         await make_and_send_spend_bundle(
-            sim, sim_client, singleton_eve, delegated_puzzle, [singleton_eve_coin_spend], is_eligible_for_ff
+            sim,
+            sim_client,
+            [eve_coin_spend],
+            is_eligible_for_ff,
+            signing_puzzle=delegated_puzzle,
+            signing_coin=singleton_eve,
         )
         # Now we spent eve and we have an unspent singleton that we can test with
         singleton = (await sim.all_non_reward_coins())[0]
@@ -844,17 +846,20 @@ async def test_foo(is_eligible_for_ff: bool) -> None:
             parent_parent_id=singleton_eve.parent_coin_info,
         )
         # Let's spend this first version, to create singleton child
-        singleton_coin_spend, delegated_puzzle = make_singleton_coin_spend(
-            parent_coin_spend=singleton_eve_coin_spend,
+        singleton_coin_spend, singleton_signing_puzzle = make_singleton_coin_spend(
+            parent_coin_spend=eve_coin_spend,
             coin_to_spend=singleton,
             inner_puzzle=inner_puzzle,
-            inner_conditions=[
-                [ConditionOpcode.CREATE_COIN, inner_puzzle_hash, singleton_eve_coin_spend.coin.amount - 4]
-            ],
+            inner_conditions=[[ConditionOpcode.CREATE_COIN, inner_puzzle_hash, eve_coin_spend.coin.amount - 4]],
         )
         # We spend the singleton and get its child as the most recent unspent
         await make_and_send_spend_bundle(
-            sim, sim_client, singleton, delegated_puzzle, [singleton_coin_spend], is_eligible_for_ff
+            sim,
+            sim_client,
+            [singleton_coin_spend],
+            is_eligible_for_ff,
+            signing_puzzle=singleton_signing_puzzle,
+            signing_coin=singleton,
         )
         unspent_lineage_ids = await sim_client.service.coin_store.get_unspent_lineage_ids_for_puzzle_hash(
             singleton_puzzle_hash
@@ -869,7 +874,12 @@ async def test_foo(is_eligible_for_ff: bool) -> None:
         )
         # Now let's spend the first version again (despite being already spent by now)
         status, error = await make_and_send_spend_bundle(
-            sim, sim_client, singleton, delegated_puzzle, [singleton_coin_spend], is_eligible_for_ff
+            sim,
+            sim_client,
+            [singleton_coin_spend],
+            is_eligible_for_ff,
+            signing_puzzle=singleton_signing_puzzle,
+            signing_coin=singleton,
         )
         if is_eligible_for_ff:
             # Instead of rejecting this as double spend, we perform a fast forward,
@@ -888,7 +898,6 @@ async def test_foo(is_eligible_for_ff: bool) -> None:
                 parent_amount=singleton_grandchild.amount,
                 parent_parent_id=singleton.name(),
             )
-            print("done testing this path")
         else:
             # As this singleton is not eligible for fast forward, attempting to
             # spend one of its earlier versions is considered a double spend
