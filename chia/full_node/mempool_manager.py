@@ -10,7 +10,10 @@ from multiprocessing.context import BaseContext
 from typing import Awaitable, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
 from blspy import GTElement
-from chia_rs import ELIGIBLE_FOR_DEDUP
+from chia_rs import ELIGIBLE_FOR_DEDUP, ELIGIBLE_FOR_FF
+from chia_rs import CoinSpend as RustCoinSpend
+from chia_rs import Program as RustProgram
+from chia_rs import supports_fast_forward
 from chiabip158 import PyBIP158
 
 from chia.consensus.block_record import BlockRecordProtocol
@@ -27,6 +30,7 @@ from chia.types.blockchain_format.coin import Coin
 from chia.types.blockchain_format.sized_bytes import bytes32, bytes48
 from chia.types.clvm_cost import CLVMCost
 from chia.types.coin_record import CoinRecord
+from chia.types.eligible_coin_spends import UnspentLineageIds
 from chia.types.fee_rate import FeeRate
 from chia.types.mempool_inclusion_status import MempoolInclusionStatus
 from chia.types.mempool_item import BundleCoinSpend, MempoolItem
@@ -71,6 +75,7 @@ def validate_clvm_and_signature(
         )
 
         if result.error is not None:
+            print("result.error: ", result.error)
             return Err(result.error), b"", {}
 
         pks: List[bytes48] = []
@@ -209,13 +214,17 @@ class MempoolManager:
     def shut_down(self) -> None:
         self.pool.shutdown(wait=True)
 
-    def create_bundle_from_mempool(
-        self, last_tb_header_hash: bytes32, item_inclusion_filter: Optional[Callable[[bytes32], bool]] = None
+    async def create_bundle_from_mempool(
+        self,
+        last_tb_header_hash: bytes32,
+        get_unspent_lineage_ids_for_puzzle_hash: Callable[[bytes32], Awaitable[Optional[UnspentLineageIds]]],
+        item_inclusion_filter: Optional[Callable[[bytes32], bool]] = None,
     ) -> Optional[Tuple[SpendBundle, List[Coin]]]:
         """
         Returns aggregated spendbundle that can be used for creating new block,
         additions and removals in that spend_bundle
         """
+
         if self.peak is None or self.peak.header_hash != last_tb_header_hash:
             return None
         if item_inclusion_filter is None:
@@ -224,7 +233,9 @@ class MempoolManager:
                 return True
 
             item_inclusion_filter = always
-        return self.mempool.create_bundle_from_mempool_items(item_inclusion_filter)
+        return await self.mempool.create_bundle_from_mempool_items(
+            item_inclusion_filter, get_unspent_lineage_ids_for_puzzle_hash, self.constants, self.peak.height
+        )
 
     def get_filter(self) -> bytes:
         all_transactions: Set[bytes32] = set()
@@ -291,6 +302,7 @@ class MempoolManager:
         )
 
         if err is not None:
+            print("got validation error: ", err)
             raise ValidationError(err)
         for cache_entry_key, cached_entry_value in new_cache_entries.items():
             LOCAL_CACHE.put(cache_entry_key, GTElement.from_bytes_unchecked(cached_entry_value))
@@ -392,7 +404,7 @@ class MempoolManager:
         removal_names: Set[bytes32] = set()
         additions_dict: Dict[bytes32, Coin] = {}
         addition_amount: int = 0
-        eligibility_and_additions: Dict[bytes32, Tuple[bool, List[Coin]]] = {}
+        eligibility_and_additions: Dict[bytes32, Tuple[bool, List[Coin], bool]] = {}
         non_eligible_coin_ids: List[bytes32] = []
         for spend in npc_result.conds.spends:
             coin_id = bytes32(spend.coin_id)
@@ -403,17 +415,35 @@ class MempoolManager:
                 spend_additions.append(child_coin)
                 additions_dict[child_coin.name()] = child_coin
                 addition_amount = addition_amount + child_coin.amount
-            is_eligible = bool(spend.flags & ELIGIBLE_FOR_DEDUP)
-            if not is_eligible:
+            is_eligible_for_dedup = bool(spend.flags & ELIGIBLE_FOR_DEDUP)
+            if not is_eligible_for_dedup:
                 non_eligible_coin_ids.append(coin_id)
-            eligibility_and_additions[coin_id] = (is_eligible, spend_additions)
+            is_eligible_for_ff = bool(spend.flags & ELIGIBLE_FOR_FF)
+            eligibility_and_additions[coin_id] = (is_eligible_for_dedup, spend_additions, is_eligible_for_ff)
         removal_names_from_coin_spends: Set[bytes32] = set()
+        fast_forward_coin_ids: Set[bytes32] = set()
         bundle_coin_spends: Dict[bytes32, BundleCoinSpend] = {}
         for coin_spend in new_spend.coin_spends:
             coin_id = coin_spend.coin.name()
             removal_names_from_coin_spends.add(coin_id)
-            eligible_for_dedup, spend_additions = eligibility_and_additions.get(coin_id, (False, []))
-            bundle_coin_spends[coin_id] = BundleCoinSpend(coin_spend, eligible_for_dedup, spend_additions)
+            eligible_for_dedup, spend_additions, eligible_for_ff = eligibility_and_additions.get(
+                coin_id, (False, [], False)
+            )
+            # We can't just go with the eligible for fast forward flag, we need to validate
+            rust_coin_spend = RustCoinSpend(
+                coin=coin_spend.coin,
+                puzzle_reveal=RustProgram.from_bytes(bytes(coin_spend.puzzle_reveal)),
+                solution=RustProgram.from_bytes(bytes(coin_spend.solution)),
+            )
+            mark_as_fast_forward = eligible_for_ff and supports_fast_forward(rust_coin_spend)
+            if mark_as_fast_forward:
+                fast_forward_coin_ids.add(coin_id)
+            bundle_coin_spends[coin_id] = BundleCoinSpend(
+                coin_spend=coin_spend,
+                eligible_for_dedup=eligible_for_dedup,
+                eligible_for_fast_forward=mark_as_fast_forward,
+                additions=spend_additions,
+            )
 
         if removal_names != removal_names_from_coin_spends:
             # If you reach here it's probably because your program reveal doesn't match the coin's puzzle hash
@@ -470,7 +500,7 @@ class MempoolManager:
                 return Err.INVALID_FEE_LOW_FEE, None, []
         # Check removals against UnspentDB + DiffStore + Mempool + SpendBundle
         # Use this information later when constructing a block
-        fail_reason, conflicts = self.check_removals(non_eligible_coin_ids, removal_record_dict)
+        fail_reason, conflicts = self.check_removals(non_eligible_coin_ids, removal_record_dict, fast_forward_coin_ids)
 
         # If we have a mempool conflict, continue, since we still want to keep around the TX in the pending pool.
         if fail_reason is not None and fail_reason is not Err.MEMPOOL_CONFLICT:
@@ -534,8 +564,12 @@ class MempoolManager:
         return None, potential, [item.name for item in conflicts]
 
     def check_removals(
-        self, non_eligible_coin_ids: List[bytes32], removals: Dict[bytes32, CoinRecord]
+        self,
+        non_eligible_coin_ids: List[bytes32],
+        removals: Dict[bytes32, CoinRecord],
+        fast_forward_coin_ids: Set[bytes32],
     ) -> Tuple[Optional[Err], List[MempoolItem]]:
+        print("inside check_removals")
         """
         This function checks for double spends, unknown spends and conflicting transactions in mempool.
         Returns Error (if any), the set of existing MempoolItems with conflicting spends (if any).
@@ -546,10 +580,19 @@ class MempoolManager:
         # 1. Checks if it's been spent already
         for record in removals.values():
             if record.spent:
-                return Err.DOUBLE_SPEND, []
+                # Only consider it a double spend if this is not a fast forward
+                if record.name not in fast_forward_coin_ids:
+                    print("fast_forward_coin_ids: ", [x.hex() for x in fast_forward_coin_ids])
+                    print("record.name: ", record.name.hex())
+                    return Err.DOUBLE_SPEND, []
+                else:
+                    print("we're letting this ff coin in")
         # 2. Checks if there's a mempool conflict
         # Only consider conflicts if the coin is not eligible for deduplication
-        conflicts = self.mempool.get_items_by_coin_ids(non_eligible_coin_ids)
+        # or singleton fast forwarding
+        coin_ids = [i for i in non_eligible_coin_ids if i not in fast_forward_coin_ids]
+        conflicts = self.mempool.get_items_by_coin_ids(coin_ids)
+        print("conflicts: ", [x.name.hex() for x in conflicts])
         if len(conflicts) > 0:
             return Err.MEMPOOL_CONFLICT, conflicts
         # 5. If coins can be spent return list of unspents as we see them in local storage
@@ -596,11 +639,22 @@ class MempoolManager:
         included_items: List[MempoolItemInfo] = []
 
         self.mempool.new_tx_block(new_peak.height, new_peak.timestamp)
+        # if self.peak is not None:
+        #     print("self.peak: ", self.peak)
+        #     print("self.peak.header_hash: ", self.peak.header_hash)
+        # else:
+        #     print("self.peak is None")
+        # if new_peak is not None:
+        #     print("new_peak.prev_transaction_block_hash: ", new_peak.prev_transaction_block_hash)
+        # else:
+        #     print("new_peak is None")
 
         use_optimization: bool = self.peak is not None and new_peak.prev_transaction_block_hash == self.peak.header_hash
         self.peak = new_peak
 
         if use_optimization and last_npc_result is not None:
+            print("**** entering OPTIMIZED path")
+            print("last_npc_result.conds: ", last_npc_result.conds)
             # We don't reinitialize a mempool, just kick removed items
             if last_npc_result.conds is not None:
                 # transactions in the mempool may be spending multiple coins,
@@ -614,23 +668,28 @@ class MempoolManager:
                         included_items.append(MempoolItemInfo(item.cost, item.fee, item.height_added_to_mempool))
                         self.remove_seen(item.name)
                         spendbundle_ids_to_remove.add(item.name)
+                print("spendbundle_ids_to_remove: ", len(spendbundle_ids_to_remove))
                 self.mempool.remove_from_pool(list(spendbundle_ids_to_remove), MempoolRemoveReason.BLOCK_INCLUSION)
         else:
+            print("*** entering REORG (non optimized) path")
             old_pool = self.mempool
             self.mempool = Mempool(old_pool.mempool_info, old_pool.fee_estimator)
             self.seen_bundle_hashes = {}
             for item in old_pool.all_items():
+                print("attempting to readd item: ", item.spend_bundle_name.hex())
                 _, result, err = await self.add_spend_bundle(
                     item.spend_bundle, item.npc_result, item.spend_bundle_name, item.height_added_to_mempool
                 )
                 # Only add to `seen` if inclusion worked, so it can be resubmitted in case of a reorg
                 if result == MempoolInclusionStatus.SUCCESS:
+                    print("Only add to `seen` if inclusion worked, so it can be resubmitted in case of a reorg")
                     self.add_and_maybe_pop_seen(item.spend_bundle_name)
                 # If the spend bundle was confirmed or conflicting (can no longer be in mempool), it won't be
                 # successfully added to the new mempool.
                 if result == MempoolInclusionStatus.FAILED and err == Err.DOUBLE_SPEND:
                     # Item was in mempool, but after the new block it's a double spend.
                     # Item is most likely included in the block.
+                    print("Item was in mempool, but after the new block it's a double spend")
                     included_items.append(MempoolItemInfo(item.cost, item.fee, item.height_added_to_mempool))
 
         potential_txs = self._pending_cache.drain(new_peak.height)
@@ -648,6 +707,7 @@ class MempoolManager:
             f"minimum fee rate (in FPC) to get in for 5M cost tx: {self.mempool.get_min_fee_rate(5000000)}"
         )
         self.mempool.fee_estimator.new_block(FeeBlockInfo(new_peak.height, included_items))
+        print("txs_added: ", len(txs_added))
         return txs_added
 
     def get_items_not_in_filter(self, mempool_filter: PyBIP158, limit: int = 100) -> List[SpendBundle]:

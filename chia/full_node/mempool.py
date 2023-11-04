@@ -4,18 +4,19 @@ import logging
 import sqlite3
 from datetime import datetime
 from enum import Enum
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Awaitable, Callable, Dict, Iterator, List, Optional, Tuple
 
 from blspy import AugSchemeMPL, G2Element
 from chia_rs import Coin
 
+from chia.consensus.constants import ConsensusConstants
 from chia.consensus.default_constants import DEFAULT_CONSTANTS
 from chia.full_node.fee_estimation import FeeMempoolInfo, MempoolInfo, MempoolItemInfo
 from chia.full_node.fee_estimator_interface import FeeEstimatorInterface
 from chia.types.blockchain_format.sized_bytes import bytes32
 from chia.types.clvm_cost import CLVMCost
 from chia.types.coin_spend import CoinSpend
-from chia.types.eligible_coin_spends import EligibleCoinSpends
+from chia.types.eligible_coin_spends import EligibleCoinSpends, UnspentLineageIds
 from chia.types.internal_mempool_item import InternalMempoolItem
 from chia.types.mempool_item import MempoolItem
 from chia.types.spend_bundle import SpendBundle
@@ -366,17 +367,25 @@ class Mempool:
 
         return self.total_mempool_cost() + cost > self.mempool_info.max_size_in_cost
 
-    def create_bundle_from_mempool_items(
-        self, item_inclusion_filter: Callable[[bytes32], bool]
+    async def create_bundle_from_mempool_items(
+        self,
+        item_inclusion_filter: Callable[[bytes32], bool],
+        get_unspent_lineage_ids_for_puzzle_hash: Callable[[bytes32], Awaitable[Optional[UnspentLineageIds]]],
+        constants: ConsensusConstants,
+        height: uint32,
     ) -> Optional[Tuple[SpendBundle, List[Coin]]]:
         cost_sum = 0  # Checks that total cost does not exceed block maximum
         fee_sum = 0  # Checks that total fees don't exceed 64 bits
         processed_spend_bundles = 0
         additions: List[Coin] = []
-        # This contains a map of coin ID to a coin spend solution and its isolated cost
-        # We reconstruct it for every bundle we create from mempool items because we
-        # deduplicate on the first coin spend solution that comes with the highest
-        # fee rate item, and that can change across calls
+        # This contains:
+        # 1. A map of coin ID to a coin spend solution and its isolated cost
+        #   We reconstruct it for every bundle we create from mempool items because we
+        #   deduplicate on the first coin spend solution that comes with the highest
+        #   fee rate item, and that can change across calls
+        # 2. A map of fast forward eligible singleton puzzle hash to the most
+        #   recent unspent singleton data, to allow chaining fast forward
+        #   singleton spends
         eligible_coin_spends = EligibleCoinSpends()
         coin_spends: List[CoinSpend] = []
         sigs: List[G2Element] = []
@@ -387,9 +396,19 @@ class Mempool:
             name = bytes32(row[0])
             fee = int(row[1])
             item = self._items[name]
+            cost = item.npc_result.cost
+            fpc = fee / cost
             if not item_inclusion_filter(name):
                 continue
             try:
+                print("************ going through item: ", name.hex())
+                print("FPC: ", fpc)
+                await eligible_coin_spends.process_fast_forward_spends(
+                    mempool_item=item,
+                    get_unspent_lineage_ids_for_puzzle_hash=get_unspent_lineage_ids_for_puzzle_hash,
+                    height=height,
+                    constants=constants,
+                )
                 unique_coin_spends, cost_saving, unique_additions = eligible_coin_spends.get_deduplication_info(
                     bundle_coin_spends=item.bundle_coin_spends, max_cost=item.npc_result.cost
                 )
@@ -407,14 +426,19 @@ class Mempool:
                 fee_sum += fee
                 processed_spend_bundles += 1
             except Exception as e:
+                print("======= EXCEPTION =======: ", e)
                 log.debug(f"Exception while checking a mempool item for deduplication: {e}")
                 continue
         if processed_spend_bundles == 0:
+            print("we didn't process any items?")
             return None
+        print("creating bundle with items: ", processed_spend_bundles)
         log.info(
             f"Cumulative cost of block (real cost should be less) {cost_sum}. Proportion "
             f"full: {cost_sum / self.mempool_info.max_block_clvm_cost}"
         )
         aggregated_signature = AugSchemeMPL.aggregate(sigs)
+        print("additions: ", [x.name().hex() for x in additions])
+        print("coin_spends: ", coin_spends[0].coin.name().hex())
         agg = SpendBundle(coin_spends, aggregated_signature)
         return agg, additions

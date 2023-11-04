@@ -5,7 +5,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 import pytest
 from blspy import G1Element, G2Element
-from chia_rs import ELIGIBLE_FOR_DEDUP
+from chia_rs import ELIGIBLE_FOR_DEDUP, ELIGIBLE_FOR_FF
 from chiabip158 import PyBIP158
 
 from chia.consensus.constants import ConsensusConstants
@@ -35,7 +35,7 @@ from chia.types.blockchain_format.sized_bytes import bytes32
 from chia.types.coin_record import CoinRecord
 from chia.types.coin_spend import CoinSpend
 from chia.types.condition_opcodes import ConditionOpcode
-from chia.types.eligible_coin_spends import DedupCoinSpend, EligibleCoinSpends, run_for_cost
+from chia.types.eligible_coin_spends import DedupCoinSpend, EligibleCoinSpends, UnspentLineageIds, run_for_cost
 from chia.types.mempool_inclusion_status import MempoolInclusionStatus
 from chia.types.mempool_item import BundleCoinSpend, MempoolItem
 from chia.types.peer_info import PeerInfo
@@ -352,7 +352,7 @@ def make_bundle_spends_map_and_fee(
     spend_bundle: SpendBundle, npc_result: NPCResult
 ) -> Tuple[Dict[bytes32, BundleCoinSpend], uint64]:
     bundle_coin_spends: Dict[bytes32, BundleCoinSpend] = {}
-    eligibility_and_additions: Dict[bytes32, Tuple[bool, List[Coin]]] = {}
+    eligibility_and_additions: Dict[bytes32, Tuple[bool, List[Coin], bool]] = {}
     removals_amount = 0
     additions_amount = 0
     assert npc_result.conds is not None
@@ -362,12 +362,23 @@ def make_bundle_spends_map_and_fee(
         for puzzle_hash, amount, _ in spend.create_coin:
             spend_additions.append(Coin(coin_id, puzzle_hash, amount))
             additions_amount += amount
-        eligibility_and_additions[coin_id] = (bool(spend.flags & ELIGIBLE_FOR_DEDUP), spend_additions)
+        eligibility_and_additions[coin_id] = (
+            bool(spend.flags & ELIGIBLE_FOR_DEDUP),
+            spend_additions,
+            bool(spend.flags & ELIGIBLE_FOR_FF),
+        )
     for coin_spend in spend_bundle.coin_spends:
         coin_id = coin_spend.coin.name()
         removals_amount += coin_spend.coin.amount
-        eligible_for_dedup, spend_additions = eligibility_and_additions.get(coin_id, (False, []))
-        bundle_coin_spends[coin_id] = BundleCoinSpend(coin_spend, eligible_for_dedup, spend_additions)
+        eligible_for_dedup, spend_additions, eligible_for_ff = eligibility_and_additions.get(
+            coin_id, (False, [], False)
+        )
+        bundle_coin_spends[coin_id] = BundleCoinSpend(
+            coin_spend=coin_spend,
+            eligible_for_dedup=eligible_for_dedup,
+            eligible_for_fast_forward=eligible_for_ff,
+            additions=spend_additions,
+        )
     fee = uint64(removals_amount - additions_amount)
     return bundle_coin_spends, fee
 
@@ -908,6 +919,9 @@ async def test_total_mempool_fees() -> None:
 @pytest.mark.parametrize("reverse_tx_order", [True, False])
 @pytest.mark.asyncio
 async def test_create_bundle_from_mempool(reverse_tx_order: bool) -> None:
+    async def get_unspent_lineage_ids_for_puzzle_hash(_: bytes32) -> Optional[UnspentLineageIds]:
+        assert False
+
     async def make_coin_spends(coins: List[Coin], *, high_fees: bool = True) -> List[CoinSpend]:
         spends_list = []
         for i in range(0, len(coins)):
@@ -934,7 +948,9 @@ async def test_create_bundle_from_mempool(reverse_tx_order: bool) -> None:
     spends = low_rate_spends + high_rate_spends if reverse_tx_order else high_rate_spends + low_rate_spends
     await send_spends_to_mempool(spends)
     assert mempool_manager.peak is not None
-    result = mempool_manager.create_bundle_from_mempool(mempool_manager.peak.header_hash)
+    result = await mempool_manager.create_bundle_from_mempool(
+        mempool_manager.peak.header_hash, get_unspent_lineage_ids_for_puzzle_hash
+    )
     assert result is not None
     # Make sure we filled the block with only high rate spends
     assert len([s for s in high_rate_spends if s in result[0].coin_spends]) == len(result[0].coin_spends)
@@ -943,6 +959,9 @@ async def test_create_bundle_from_mempool(reverse_tx_order: bool) -> None:
 
 @pytest.mark.asyncio
 async def test_create_bundle_from_mempool_on_max_cost() -> None:
+    async def get_unspent_lineage_ids_for_puzzle_hash(_: bytes32) -> Optional[UnspentLineageIds]:
+        assert False
+
     # This test exercises the path where an item's inclusion would exceed the
     # maximum cumulative cost, so it gets skipped as a result
     async def make_and_send_big_cost_sb(coin: Coin) -> None:
@@ -964,7 +983,9 @@ async def test_create_bundle_from_mempool_on_max_cost() -> None:
     sb2, _, res = await generate_and_add_spendbundle(mempool_manager, conditions, coins[1])
     assert res[1] == MempoolInclusionStatus.SUCCESS
     assert mempool_manager.peak is not None
-    result = mempool_manager.create_bundle_from_mempool(mempool_manager.peak.header_hash)
+    result = await mempool_manager.create_bundle_from_mempool(
+        mempool_manager.peak.header_hash, get_unspent_lineage_ids_for_puzzle_hash
+    )
     assert result is not None
     agg, additions = result
     # The second spend bundle has a higher FPC so it should get picked first
@@ -1391,11 +1412,13 @@ async def test_bundle_coin_spends() -> None:
         assert mi123e.bundle_coin_spends[coins[i].name()] == BundleCoinSpend(
             coin_spend=sb123.coin_spends[i],
             eligible_for_dedup=False,
+            eligible_for_fast_forward=False,
             additions=[Coin(coins[i].name(), IDENTITY_PUZZLE_HASH, coins[i].amount)],
         )
     assert mi123e.bundle_coin_spends[coins[3].name()] == BundleCoinSpend(
         coin_spend=eligible_sb.coin_spends[0],
         eligible_for_dedup=True,
+        eligible_for_fast_forward=False,
         additions=[Coin(coins[3].name(), IDENTITY_PUZZLE_HASH, coins[3].amount)],
     )
 

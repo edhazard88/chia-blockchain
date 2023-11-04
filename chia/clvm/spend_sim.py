@@ -109,6 +109,7 @@ class SimBlockRecord(Streamable):
 
     @classmethod
     def create(cls: Type[_T_SimBlockRecord], rci: List[Coin], height: uint32, timestamp: uint64) -> _T_SimBlockRecord:
+        prev_transaction_block_height = uint32(height - 1 if height > 0 else 0)
         return cls(
             rci,
             height,
@@ -116,7 +117,7 @@ class SimBlockRecord(Streamable):
             timestamp,
             True,
             std_hash(bytes(height)),
-            std_hash(std_hash(height)),
+            std_hash(bytes(prev_transaction_block_height)),
         )
 
 
@@ -189,8 +190,8 @@ class SpendSim:
             await c.close()
         await self.db_wrapper.close()
 
-    async def new_peak(self) -> None:
-        await self.mempool_manager.new_peak(self.block_records[-1], None)
+    async def new_peak(self, npc_result: Optional[NPCResult]) -> None:
+        await self.mempool_manager.new_peak(self.block_records[-1], npc_result)
 
     def new_coin_record(self, coin: Coin, coinbase: bool = False) -> CoinRecord:
         return CoinRecord(
@@ -255,7 +256,11 @@ class SpendSim:
         if (len(self.block_records) > 0) and (self.mempool_manager.mempool.size() > 0):
             peak = self.mempool_manager.peak
             if peak is not None:
-                result = self.mempool_manager.create_bundle_from_mempool(peak.header_hash, item_inclusion_filter)
+                result = await self.mempool_manager.create_bundle_from_mempool(
+                    last_tb_header_hash=peak.header_hash,
+                    get_unspent_lineage_ids_for_puzzle_hash=self.coin_store.get_unspent_lineage_ids_for_puzzle_hash,
+                    item_inclusion_filter=item_inclusion_filter,
+                )
 
                 if result is not None:
                     bundle, additions = result
@@ -268,6 +273,16 @@ class SpendSim:
 
         # SimBlockRecord is created
         generator: Optional[BlockGenerator] = await self.generate_transaction_generator(generator_bundle)
+        npc_result = None
+        if generator is not None:
+            npc_result = get_name_puzzle_conditions(
+                generator=generator,
+                max_cost=DEFAULT_CONSTANTS.MAX_BLOCK_COST_CLVM,
+                mempool_mode=False,
+                height=next_block_height,
+                constants=DEFAULT_CONSTANTS,
+            )
+        # print("npc_result: ", npc_result)
         self.block_records.append(
             SimBlockRecord.create(
                 [pool_coin, farmer_coin],
@@ -281,9 +296,12 @@ class SpendSim:
         self.block_height = next_block_height
 
         # mempool is reset
-        await self.new_peak()
+        await self.new_peak(npc_result)
 
         # return some debugging data
+        # print("return some debugging data")
+        # print("return_additions: ", [x.name().hex() for x in return_additions])
+        # print("return_removals: ", [x.name().hex() for x in return_removals])
         return return_additions, return_removals
 
     def get_height(self) -> uint32:
@@ -321,6 +339,7 @@ class SimClient:
                 spend_bundle, None, spend_bundle_id
             )
         except ValidationError as e:
+            print("exception: ", e)
             return MempoolInclusionStatus.FAILED, e.code
         assert self.service.mempool_manager.peak
         cost, status, error = await self.service.mempool_manager.add_spend_bundle(

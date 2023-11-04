@@ -207,7 +207,9 @@ class FullNodeSimulator(FullNodeAPI):
                     await asyncio.sleep(1)
                 else:
                     current_time = False
-            mempool_bundle = self.full_node.mempool_manager.create_bundle_from_mempool(curr.header_hash)
+            mempool_bundle = await self.full_node.mempool_manager.create_bundle_from_mempool(
+                curr.header_hash, self.full_node.coin_store.get_unspent_lineage_ids_for_puzzle_hash
+            )
             if mempool_bundle is None:
                 spend_bundle = None
             else:
@@ -256,7 +258,9 @@ class FullNodeSimulator(FullNodeAPI):
                     await asyncio.sleep(1)
                 else:
                     current_time = False
-            mempool_bundle = self.full_node.mempool_manager.create_bundle_from_mempool(curr.header_hash)
+            mempool_bundle = await self.full_node.mempool_manager.create_bundle_from_mempool(
+                curr.header_hash, self.full_node.coin_store.get_unspent_lineage_ids_for_puzzle_hash
+            )
             if mempool_bundle is None:
                 spend_bundle = None
             else:
