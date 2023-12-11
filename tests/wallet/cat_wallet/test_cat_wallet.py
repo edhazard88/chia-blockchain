@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import tempfile
 from pathlib import Path
-from typing import List
 
 import pytest
 
@@ -11,7 +10,6 @@ from chia.consensus.block_rewards import calculate_base_farmer_reward, calculate
 from chia.protocols.wallet_protocol import CoinState
 from chia.rpc.wallet_rpc_api import WalletRpcApi
 from chia.rpc.wallet_rpc_client import WalletRpcClient
-from chia.simulator.full_node_simulator import FullNodeSimulator
 from chia.simulator.simulator_protocol import FarmNewBlockProtocol, ReorgProtocol
 from chia.types.blockchain_format.coin import Coin, coin_as_list
 from chia.types.blockchain_format.program import Program
@@ -29,23 +27,27 @@ from chia.wallet.derivation_record import DerivationRecord
 from chia.wallet.derive_keys import _derive_path_unhardened, master_sk_to_wallet_sk_unhardened_intermediate
 from chia.wallet.lineage_proof import LineageProof
 from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import puzzle_hash_for_pk
-from chia.wallet.transaction_record import TransactionRecord
 from chia.wallet.util.tx_config import DEFAULT_COIN_SELECTION_CONFIG, DEFAULT_TX_CONFIG
 from chia.wallet.util.wallet_types import WalletType
 from chia.wallet.wallet_info import WalletInfo
 from chia.wallet.wallet_interested_store import WalletInterestedStore
+from chia.wallet.wallet_node import WalletNode
+from chia.wallet.wallet_state_manager import WalletStateManager
 from tests.conftest import ConsensusMode
-from tests.util.setup_nodes import SimulatorsAndWalletsServices
+from tests.util.setup_nodes import OldSimulatorsAndWallets, SimulatorsAndWalletsServices
 from tests.util.time_out_assert import time_out_assert, time_out_assert_not_none
 
 
+def check_wallets(node: WalletNode) -> int:
+    return len(node.wallet_state_manager.wallets.keys())
+
+
 class TestCATWallet:
-    @pytest.mark.parametrize(
-        "trusted",
-        [True, False],
-    )
+    @pytest.mark.parametrize("trusted", [True, False])
     @pytest.mark.anyio
-    async def test_cat_creation(self, self_hostname, two_wallet_nodes, trusted):
+    async def test_cat_creation(
+        self, self_hostname: str, two_wallet_nodes: OldSimulatorsAndWallets, trusted: bool
+    ) -> None:
         num_blocks = 3
         full_nodes, wallets, _ = two_wallet_nodes
         full_node_api = full_nodes[0]
@@ -62,7 +64,7 @@ class TestCATWallet:
         await server_2.start_client(PeerInfo(self_hostname, full_node_server.get_port()), None)
         for i in range(0, num_blocks):
             await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(ph))
-        await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(32 * b"0"))
+        await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(bytes32(32 * b"0")))
 
         funds = sum(
             [
@@ -75,7 +77,7 @@ class TestCATWallet:
         await full_node_api.wait_for_wallet_synced(wallet_node=wallet_node, timeout=20)
 
         async with wallet_node.wallet_state_manager.lock:
-            cat_wallet: CATWallet = await CATWallet.create_new_cat_wallet(
+            cat_wallet = await CATWallet.create_new_cat_wallet(
                 wallet_node.wallet_state_manager,
                 wallet,
                 {"identifier": "genesis_by_id"},
@@ -87,7 +89,7 @@ class TestCATWallet:
             cat_wallet = await CATWallet.create(wallet_node.wallet_state_manager, wallet, cat_wallet.wallet_info)
             await wallet_node.wallet_state_manager.add_new_wallet(cat_wallet)
 
-        tx_queue: List[TransactionRecord] = await wallet_node.wallet_state_manager.tx_store.get_not_sent()
+        tx_queue = await wallet_node.wallet_state_manager.tx_store.get_not_sent()
         tx_record = tx_queue[0]
         await full_node_api.process_transaction_records(records=[tx_record])
 
@@ -113,13 +115,16 @@ class TestCATWallet:
         assert await cat_wallet.lineage_store.get_all_lineage_proofs() == all_lineage
 
         height = full_node_api.full_node.blockchain.get_peak_height()
+        assert height is not None
         await full_node_api.reorg_from_index_to_new_index(
-            ReorgProtocol(height - num_blocks - 1, height + 1, 32 * b"1", None)
+            ReorgProtocol(uint32(height - num_blocks - 1), uint32(height + 1), bytes32(32 * b"1"), None)
         )
         await time_out_assert(20, cat_wallet.get_confirmed_balance, 0)
 
     @pytest.mark.anyio
-    async def test_cat_creation_unique_lineage_store(self, self_hostname, two_wallet_nodes):
+    async def test_cat_creation_unique_lineage_store(
+        self, self_hostname: str, two_wallet_nodes: OldSimulatorsAndWallets
+    ) -> None:
         num_blocks = 3
         full_nodes, wallets, _ = two_wallet_nodes
         full_node_api = full_nodes[0]
@@ -132,7 +137,7 @@ class TestCATWallet:
         await wallet_server.start_client(PeerInfo(self_hostname, full_node_server.get_port()), None)
         for i in range(0, num_blocks):
             await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(ph))
-        await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(32 * b"0"))
+        await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(bytes32(32 * b"0")))
 
         funds = sum(
             [
@@ -145,14 +150,14 @@ class TestCATWallet:
         await full_node_api.wait_for_wallet_synced(wallet_node=wallet_node, timeout=20)
 
         async with wallet_node.wallet_state_manager.lock:
-            cat_wallet_1: CATWallet = await CATWallet.create_new_cat_wallet(
+            cat_wallet_1 = await CATWallet.create_new_cat_wallet(
                 wallet_node.wallet_state_manager,
                 wallet,
                 {"identifier": "genesis_by_id"},
                 uint64(100),
                 DEFAULT_TX_CONFIG,
             )
-            cat_wallet_2: CATWallet = await CATWallet.create_new_cat_wallet(
+            cat_wallet_2 = await CATWallet.create_new_cat_wallet(
                 wallet_node.wallet_state_manager,
                 wallet,
                 {"identifier": "genesis_by_id"},
@@ -166,12 +171,11 @@ class TestCATWallet:
         assert proofs_1 != proofs_2
         assert cat_wallet_1.lineage_store.table_name != cat_wallet_2.lineage_store.table_name
 
-    @pytest.mark.parametrize(
-        "trusted",
-        [True, False],
-    )
+    @pytest.mark.parametrize("trusted", [True, False])
     @pytest.mark.anyio
-    async def test_cat_spend(self, self_hostname, two_wallet_nodes, trusted):
+    async def test_cat_spend(
+        self, self_hostname: str, two_wallet_nodes: OldSimulatorsAndWallets, trusted: bool
+    ) -> None:
         num_blocks = 3
         full_nodes, wallets, _ = two_wallet_nodes
         full_node_api = full_nodes[0]
@@ -194,7 +198,7 @@ class TestCATWallet:
 
         for i in range(0, num_blocks):
             await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(ph))
-        await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(32 * b"0"))
+        await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(bytes32(32 * b"0")))
 
         funds = sum(
             [
@@ -206,14 +210,14 @@ class TestCATWallet:
         await time_out_assert(20, wallet.get_confirmed_balance, funds)
 
         async with wallet_node.wallet_state_manager.lock:
-            cat_wallet: CATWallet = await CATWallet.create_new_cat_wallet(
+            cat_wallet = await CATWallet.create_new_cat_wallet(
                 wallet_node.wallet_state_manager,
                 wallet,
                 {"identifier": "genesis_by_id"},
                 uint64(100),
                 DEFAULT_TX_CONFIG,
             )
-        tx_queue: List[TransactionRecord] = await wallet_node.wallet_state_manager.tx_store.get_not_sent()
+        tx_queue = await wallet_node.wallet_state_manager.tx_store.get_not_sent()
         tx_record = tx_queue[0]
         await full_node_api.process_transaction_records(records=[tx_record])
 
@@ -223,7 +227,7 @@ class TestCATWallet:
         assert cat_wallet.cat_info.limitations_program_hash is not None
         asset_id = cat_wallet.get_asset_id()
 
-        cat_wallet_2: CATWallet = await CATWallet.get_or_create_wallet_for_cat(
+        cat_wallet_2 = await CATWallet.get_or_create_wallet_for_cat(
             wallet_node_2.wallet_state_manager, wallet2, asset_id
         )
 
@@ -243,12 +247,13 @@ class TestCATWallet:
         await time_out_assert(15, full_node_api.txs_in_mempool, True, tx_records)
 
         await time_out_assert(20, cat_wallet.get_pending_change_balance, 40)
-        memos = await api_0.get_transaction_memo(dict(transaction_id=tx_id))
+        assert tx_id is not None
+        memos = await api_0.get_transaction_memo({"transaction_id": tx_id})
         assert len(memos[tx_id]) == 2  # One for tx, one for change
         assert list(memos[tx_id].values())[0][0] == cat_2_hash.hex()
 
         for i in range(1, num_blocks):
-            await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(32 * b"\0"))
+            await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(bytes32(32 * b"\0")))
 
         await time_out_assert(30, wallet.get_confirmed_balance, funds - 101)
 
@@ -277,15 +282,17 @@ class TestCATWallet:
         await time_out_assert(20, cat_wallet.get_unconfirmed_balance, 55)
 
         height = full_node_api.full_node.blockchain.get_peak_height()
-        await full_node_api.reorg_from_index_to_new_index(ReorgProtocol(height - 1, height + 1, 32 * b"1", None))
+        assert height is not None
+        await full_node_api.reorg_from_index_to_new_index(
+            ReorgProtocol(uint32(height - 1), uint32(height + 1), bytes32(32 * b"1"), None)
+        )
         await time_out_assert(20, cat_wallet.get_confirmed_balance, 40)
 
-    @pytest.mark.parametrize(
-        "trusted",
-        [True, False],
-    )
+    @pytest.mark.parametrize("trusted", [True, False])
     @pytest.mark.anyio
-    async def test_cat_reuse_address(self, self_hostname, two_wallet_nodes, trusted):
+    async def test_cat_reuse_address(
+        self, self_hostname: str, two_wallet_nodes: OldSimulatorsAndWallets, trusted: bool
+    ) -> None:
         num_blocks = 3
         full_nodes, wallets, _ = two_wallet_nodes
         full_node_api = full_nodes[0]
@@ -307,7 +314,7 @@ class TestCATWallet:
 
         for i in range(0, num_blocks):
             await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(ph))
-        await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(32 * b"0"))
+        await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(bytes32(32 * b"0")))
 
         funds = sum(
             [
@@ -319,14 +326,14 @@ class TestCATWallet:
         await time_out_assert(20, wallet.get_confirmed_balance, funds)
 
         async with wallet_node.wallet_state_manager.lock:
-            cat_wallet: CATWallet = await CATWallet.create_new_cat_wallet(
+            cat_wallet = await CATWallet.create_new_cat_wallet(
                 wallet_node.wallet_state_manager,
                 wallet,
                 {"identifier": "genesis_by_id"},
                 uint64(100),
                 DEFAULT_TX_CONFIG,
             )
-        tx_queue: List[TransactionRecord] = await wallet_node.wallet_state_manager.tx_store.get_not_sent()
+        tx_queue = await wallet_node.wallet_state_manager.tx_store.get_not_sent()
         tx_record = tx_queue[0]
         await full_node_api.process_transaction_records(records=[tx_record])
 
@@ -336,7 +343,7 @@ class TestCATWallet:
         assert cat_wallet.cat_info.limitations_program_hash is not None
         asset_id = cat_wallet.get_asset_id()
 
-        cat_wallet_2: CATWallet = await CATWallet.get_or_create_wallet_for_cat(
+        cat_wallet_2 = await CATWallet.get_or_create_wallet_for_cat(
             wallet_node_2.wallet_state_manager, wallet2, asset_id
         )
 
@@ -350,6 +357,7 @@ class TestCATWallet:
             await wallet.wallet_state_manager.add_pending_transaction(tx_record)
             if tx_record.wallet_id is cat_wallet.id():
                 assert tx_record.to_puzzle_hash == cat_2_hash
+                assert tx_record.spend_bundle is not None
                 assert len(tx_record.spend_bundle.coin_spends) == 2
                 for cs in tx_record.spend_bundle.coin_spends:
                     if cs.coin.amount == 100:
@@ -362,7 +370,7 @@ class TestCATWallet:
         await time_out_assert(20, cat_wallet.get_pending_change_balance, 40)
 
         for i in range(1, num_blocks):
-            await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(32 * b"\0"))
+            await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(bytes32(32 * b"\0")))
 
         await time_out_assert(30, wallet.get_confirmed_balance, funds - 101)
 
@@ -385,15 +393,17 @@ class TestCATWallet:
         await time_out_assert(20, cat_wallet.get_unconfirmed_balance, 55)
 
         height = full_node_api.full_node.blockchain.get_peak_height()
-        await full_node_api.reorg_from_index_to_new_index(ReorgProtocol(height - 1, height + 1, 32 * b"1", None))
+        assert height is not None
+        await full_node_api.reorg_from_index_to_new_index(
+            ReorgProtocol(uint32(height - 1), uint32(height + 1), bytes32(32 * b"1"), None)
+        )
         await time_out_assert(20, cat_wallet.get_confirmed_balance, 40)
 
-    @pytest.mark.parametrize(
-        "trusted",
-        [True, False],
-    )
+    @pytest.mark.parametrize("trusted", [True, False])
     @pytest.mark.anyio
-    async def test_get_wallet_for_asset_id(self, self_hostname, two_wallet_nodes, trusted):
+    async def test_get_wallet_for_asset_id(
+        self, self_hostname: str, two_wallet_nodes: OldSimulatorsAndWallets, trusted: bool
+    ) -> None:
         num_blocks = 3
         full_nodes, wallets, _ = two_wallet_nodes
         full_node_api = full_nodes[0]
@@ -410,7 +420,7 @@ class TestCATWallet:
 
         for i in range(0, num_blocks):
             await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(ph))
-        await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(32 * b"0"))
+        await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(bytes32(32 * b"0")))
 
         funds = sum(
             [
@@ -422,7 +432,7 @@ class TestCATWallet:
         await time_out_assert(20, wallet.get_confirmed_balance, funds)
 
         async with wallet_node.wallet_state_manager.lock:
-            cat_wallet: CATWallet = await CATWallet.create_new_cat_wallet(
+            cat_wallet = await CATWallet.create_new_cat_wallet(
                 wallet_node.wallet_state_manager,
                 wallet,
                 {"identifier": "genesis_by_id"},
@@ -431,9 +441,10 @@ class TestCATWallet:
             )
 
         for i in range(1, num_blocks):
-            await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(32 * b"0"))
+            await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(bytes32(32 * b"0")))
 
         asset_id = cat_wallet.get_asset_id()
+        assert cat_wallet.cat_info.my_tail is not None
         await cat_wallet.set_tail_program(bytes(cat_wallet.cat_info.my_tail).hex())
         assert await wallet_node.wallet_state_manager.get_wallet_for_asset_id(asset_id) == cat_wallet
 
@@ -445,12 +456,11 @@ class TestCATWallet:
         await cat_wallet_2.set_name("Test Name")
         assert cat_wallet_2.get_name() == "Test Name"
 
-    @pytest.mark.parametrize(
-        "trusted",
-        [True, False],
-    )
+    @pytest.mark.parametrize("trusted", [True, False])
     @pytest.mark.anyio
-    async def test_cat_doesnt_see_eve(self, self_hostname, two_wallet_nodes, trusted):
+    async def test_cat_doesnt_see_eve(
+        self, self_hostname: str, two_wallet_nodes: OldSimulatorsAndWallets, trusted: bool
+    ) -> None:
         num_blocks = 3
         full_nodes, wallets, _ = two_wallet_nodes
         full_node_api = full_nodes[0]
@@ -472,7 +482,7 @@ class TestCATWallet:
 
         for i in range(0, num_blocks):
             await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(ph))
-        await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(32 * b"0"))
+        await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(bytes32(32 * b"0")))
 
         funds = sum(
             [
@@ -484,14 +494,14 @@ class TestCATWallet:
         await time_out_assert(20, wallet.get_confirmed_balance, funds)
 
         async with wallet_node.wallet_state_manager.lock:
-            cat_wallet: CATWallet = await CATWallet.create_new_cat_wallet(
+            cat_wallet = await CATWallet.create_new_cat_wallet(
                 wallet_node.wallet_state_manager,
                 wallet,
                 {"identifier": "genesis_by_id"},
                 uint64(100),
                 DEFAULT_TX_CONFIG,
             )
-        tx_records: List[TransactionRecord] = await wallet_node.wallet_state_manager.tx_store.get_not_sent()
+        tx_records = await wallet_node.wallet_state_manager.tx_store.get_not_sent()
         await full_node_api.process_transaction_records(records=tx_records)
 
         await time_out_assert(20, cat_wallet.get_confirmed_balance, 100)
@@ -500,7 +510,7 @@ class TestCATWallet:
         assert cat_wallet.cat_info.limitations_program_hash is not None
         asset_id = cat_wallet.get_asset_id()
 
-        cat_wallet_2: CATWallet = await CATWallet.get_or_create_wallet_for_cat(
+        cat_wallet_2 = await CATWallet.get_or_create_wallet_for_cat(
             wallet_node_2.wallet_state_manager, wallet2, asset_id
         )
 
@@ -525,7 +535,7 @@ class TestCATWallet:
 
         cc2_ph = await cat_wallet_2.get_new_cat_puzzle_hash()
         [tx_record] = await wallet.wallet_state_manager.main_wallet.generate_signed_transaction(
-            10, cc2_ph, DEFAULT_TX_CONFIG, 0
+            uint64(10), cc2_ph, DEFAULT_TX_CONFIG
         )
         await wallet.wallet_state_manager.add_pending_transaction(tx_record)
         await full_node_api.process_transaction_records(records=[tx_record])
@@ -533,7 +543,7 @@ class TestCATWallet:
         id = cat_wallet_2.id()
         wsm = cat_wallet_2.wallet_state_manager
 
-        async def query_and_assert_transactions(wsm, id):
+        async def query_and_assert_transactions(wsm: WalletStateManager, id: uint32) -> int:
             all_txs = await wsm.tx_store.get_all_transactions_for_wallet(id)
             return len(list(filter(lambda tx: tx.amount == 10, all_txs)))
 
@@ -542,12 +552,11 @@ class TestCATWallet:
         await time_out_assert(20, cat_wallet_2.get_confirmed_balance, 60)
         await time_out_assert(20, cat_wallet_2.get_unconfirmed_balance, 60)
 
-    @pytest.mark.parametrize(
-        "trusted",
-        [True, False],
-    )
+    @pytest.mark.parametrize("trusted", [True, False])
     @pytest.mark.anyio
-    async def test_cat_spend_multiple(self, self_hostname, three_wallet_nodes, trusted):
+    async def test_cat_spend_multiple(
+        self, self_hostname: str, three_wallet_nodes: OldSimulatorsAndWallets, trusted: bool
+    ) -> None:
         num_blocks = 3
         full_nodes, wallets, _ = three_wallet_nodes
         full_node_api = full_nodes[0]
@@ -582,14 +591,14 @@ class TestCATWallet:
         await time_out_assert(20, wallet_0.get_confirmed_balance, funds)
 
         async with wallet_node_0.wallet_state_manager.lock:
-            cat_wallet_0: CATWallet = await CATWallet.create_new_cat_wallet(
+            cat_wallet_0 = await CATWallet.create_new_cat_wallet(
                 wallet_node_0.wallet_state_manager,
                 wallet_0,
                 {"identifier": "genesis_by_id"},
                 uint64(100),
                 DEFAULT_TX_CONFIG,
             )
-        tx_records: List[TransactionRecord] = await wallet_node_0.wallet_state_manager.tx_store.get_not_sent()
+        tx_records = await wallet_node_0.wallet_state_manager.tx_store.get_not_sent()
         await full_node_api.process_transaction_records(records=tx_records)
 
         await time_out_assert(20, cat_wallet_0.get_confirmed_balance, 100)
@@ -598,11 +607,11 @@ class TestCATWallet:
         assert cat_wallet_0.cat_info.limitations_program_hash is not None
         asset_id = cat_wallet_0.get_asset_id()
 
-        cat_wallet_1: CATWallet = await CATWallet.get_or_create_wallet_for_cat(
+        cat_wallet_1 = await CATWallet.get_or_create_wallet_for_cat(
             wallet_node_1.wallet_state_manager, wallet_1, asset_id
         )
 
-        cat_wallet_2: CATWallet = await CATWallet.get_or_create_wallet_for_cat(
+        cat_wallet_2 = await CATWallet.get_or_create_wallet_for_cat(
             wallet_node_2.wallet_state_manager, wallet_2, asset_id
         )
 
@@ -650,9 +659,9 @@ class TestCATWallet:
         await time_out_assert(30, cat_wallet_2.get_unconfirmed_balance, 0)
 
         txs = await wallet_1.wallet_state_manager.tx_store.get_transactions_between(cat_wallet_1.id(), 0, 100000)
-        print(len(txs))
+
         # Test with Memo
-        tx_records_3: TransactionRecord = await cat_wallet_1.generate_signed_transaction(
+        tx_records_3 = await cat_wallet_1.generate_signed_transaction(
             [uint64(30)], [cat_hash], DEFAULT_TX_CONFIG, memos=[[b"Markus Walburg"]]
         )
         with pytest.raises(ValueError):
@@ -669,12 +678,15 @@ class TestCATWallet:
                 memos = tx.get_memos()
                 assert len(memos) == 2  # One for tx, one for change
                 assert b"Markus Walburg" in [v for v_list in memos.values() for v in v_list]
+                assert tx.spend_bundle is not None
                 assert list(memos.keys())[0] in [a.name() for a in tx.spend_bundle.additions()]
 
     @pytest.mark.limit_consensus_modes(allowed=[ConsensusMode.PLAIN, ConsensusMode.HARD_FORK_2_0], reason="save time")
     @pytest.mark.parametrize("trusted", [True, False])
     @pytest.mark.anyio
-    async def test_cat_max_amount_send(self, self_hostname, two_wallet_nodes, trusted):
+    async def test_cat_max_amount_send(
+        self, self_hostname: str, two_wallet_nodes: OldSimulatorsAndWallets, trusted: bool
+    ) -> None:
         num_blocks = 3
         full_nodes, wallets, _ = two_wallet_nodes
         full_node_api = full_nodes[0]
@@ -695,7 +707,7 @@ class TestCATWallet:
 
         for i in range(0, num_blocks):
             await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(ph))
-        await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(32 * b"0"))
+        await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(bytes32(32 * b"0")))
 
         funds = sum(
             [
@@ -707,14 +719,14 @@ class TestCATWallet:
         await time_out_assert(20, wallet.get_confirmed_balance, funds)
 
         async with wallet_node.wallet_state_manager.lock:
-            cat_wallet: CATWallet = await CATWallet.create_new_cat_wallet(
+            cat_wallet = await CATWallet.create_new_cat_wallet(
                 wallet_node.wallet_state_manager,
                 wallet,
                 {"identifier": "genesis_by_id"},
                 uint64(100000),
                 DEFAULT_TX_CONFIG,
             )
-        tx_records: List[TransactionRecord] = await wallet_node.wallet_state_manager.tx_store.get_not_sent()
+        tx_records = await wallet_node.wallet_state_manager.tx_store.get_not_sent()
         await full_node_api.process_transaction_records(records=tx_records)
 
         await time_out_assert(20, cat_wallet.get_confirmed_balance, 100000)
@@ -739,7 +751,7 @@ class TestCATWallet:
 
         await asyncio.sleep(2)
 
-        async def check_all_there():
+        async def check_all_there() -> bool:
             spendable = await cat_wallet.get_cat_spendable_coins()
             spendable_name_set = set()
             for record in spendable:
@@ -759,35 +771,27 @@ class TestCATWallet:
 
         # 1) Generate transaction that is under the limit
         [transaction_record] = await cat_wallet.generate_signed_transaction(
-            [max_sent_amount - 1],
-            [ph],
-            DEFAULT_TX_CONFIG,
+            [uint64(max_sent_amount - 1)], [ph], DEFAULT_TX_CONFIG
         )
-
         assert transaction_record.amount == uint64(max_sent_amount - 1)
 
         # 2) Generate transaction that is equal to limit
         [transaction_record] = await cat_wallet.generate_signed_transaction(
-            [max_sent_amount],
-            [ph],
-            DEFAULT_TX_CONFIG,
+            [uint64(max_sent_amount)], [ph], DEFAULT_TX_CONFIG
         )
-
         assert transaction_record.amount == uint64(max_sent_amount)
 
         # 3) Generate transaction that is greater than limit
         with pytest.raises(ValueError):
-            await cat_wallet.generate_signed_transaction(
-                [max_sent_amount + 1],
-                [ph],
-                DEFAULT_TX_CONFIG,
-            )
+            await cat_wallet.generate_signed_transaction([uint64(max_sent_amount + 1)], [ph], DEFAULT_TX_CONFIG)
 
     @pytest.mark.limit_consensus_modes(allowed=[ConsensusMode.PLAIN, ConsensusMode.HARD_FORK_2_0], reason="save time")
     @pytest.mark.parametrize("trusted", [True, False])
     @pytest.mark.parametrize("autodiscovery", [True, False])
     @pytest.mark.anyio
-    async def test_cat_hint(self, self_hostname, two_wallet_nodes, trusted, autodiscovery):
+    async def test_cat_hint(
+        self, self_hostname: str, two_wallet_nodes: OldSimulatorsAndWallets, trusted: bool, autodiscovery: bool
+    ) -> None:
         num_blocks = 3
         full_nodes, wallets, _ = two_wallet_nodes
         full_node_api = full_nodes[0]
@@ -811,7 +815,7 @@ class TestCATWallet:
 
         for i in range(0, num_blocks):
             await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(ph))
-        await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(32 * b"0"))
+        await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(bytes32(32 * b"0")))
 
         funds = sum(
             [
@@ -823,14 +827,14 @@ class TestCATWallet:
         await time_out_assert(20, wallet.get_confirmed_balance, funds)
 
         async with wallet_node.wallet_state_manager.lock:
-            cat_wallet: CATWallet = await CATWallet.create_new_cat_wallet(
+            cat_wallet = await CATWallet.create_new_cat_wallet(
                 wallet_node.wallet_state_manager,
                 wallet,
                 {"identifier": "genesis_by_id"},
                 uint64(100),
                 DEFAULT_TX_CONFIG,
             )
-        tx_records: List[TransactionRecord] = await wallet_node.wallet_state_manager.tx_store.get_not_sent()
+        tx_records = await wallet_node.wallet_state_manager.tx_store.get_not_sent()
         await full_node_api.process_transaction_records(records=tx_records)
 
         await time_out_assert(20, cat_wallet.get_confirmed_balance, 100)
@@ -849,9 +853,6 @@ class TestCATWallet:
 
         await time_out_assert(20, cat_wallet.get_confirmed_balance, 40)
         await time_out_assert(20, cat_wallet.get_unconfirmed_balance, 40)
-
-        async def check_wallets(node):
-            return len(node.wallet_state_manager.wallets.keys())
 
         if autodiscovery:
             # Autodiscovery enabled: test that wallet was created at this point
@@ -884,7 +885,8 @@ class TestCATWallet:
 
         # Now we check that another wallet WAS created, even if autodiscovery was disabled
         await time_out_assert(20, check_wallets, 2, wallet_node_2)
-        cat_wallet_2 = wallet_node_2.wallet_state_manager.wallets[2]
+        cat_wallet_2 = wallet_node_2.wallet_state_manager.wallets[uint32(2)]
+        assert isinstance(cat_wallet_2, CATWallet)
 
         # Previous balance + balance that triggered creation in case of disabled autodiscovery
         await time_out_assert(30, cat_wallet_2.get_confirmed_balance, 70)
@@ -900,17 +902,14 @@ class TestCATWallet:
         await time_out_assert(20, cat_wallet.get_confirmed_balance, 35)
         await time_out_assert(20, cat_wallet.get_unconfirmed_balance, 35)
 
-    @pytest.mark.parametrize(
-        "trusted",
-        [True, False],
-    )
+    @pytest.mark.parametrize("trusted", [True, False])
     @pytest.mark.anyio
     async def test_cat_change_detection(
         self, self_hostname: str, one_wallet_and_one_simulator_services: SimulatorsAndWalletsServices, trusted: bool
     ) -> None:
         num_blocks = 1
         full_nodes, wallets, bt = one_wallet_and_one_simulator_services
-        full_node_api: FullNodeSimulator = full_nodes[0]._api
+        full_node_api = full_nodes[0]._api
         full_node_server = full_node_api.full_node.server
         wallet_service_0 = wallets[0]
         wallet_node_0 = wallet_service_0._node
@@ -948,17 +947,12 @@ class TestCATWallet:
             CAT_MOD, Program.to(None).get_tree_hash(), inner_puzhash
         ).get_tree_hash_precalc(inner_puzhash)
         change_derivation = DerivationRecord(
-            uint32(0),
-            puzzlehash_unhardened,
-            pubkey_unhardened,
-            WalletType.CAT,
-            uint32(2),
-            False,
+            uint32(0), puzzlehash_unhardened, pubkey_unhardened, WalletType.CAT, uint32(2), False
         )
         # Insert the derivation record before the wallet exists so that it is not subscribed to
         await wallet_node_0.wallet_state_manager.puzzle_store.add_derivation_paths([change_derivation])
-        our_puzzle: Program = await wallet_0.get_new_puzzle()
-        cat_puzzle: Program = construct_cat_puzzle(
+        our_puzzle = await wallet_0.get_new_puzzle()
+        cat_puzzle = construct_cat_puzzle(
             CAT_MOD,
             Program.to(None).get_tree_hash(),
             Program.to(1),
@@ -979,11 +973,7 @@ class TestCATWallet:
         cat_coin = next(c for c in spend_bundle.additions() if c.amount == cat_amount_0)
         next_coin = Coin(
             cat_coin.name(),
-            construct_cat_puzzle(
-                CAT_MOD,
-                Program.to(None).get_tree_hash(),
-                our_puzzle,
-            ).get_tree_hash(),
+            construct_cat_puzzle(CAT_MOD, Program.to(None).get_tree_hash(), our_puzzle).get_tree_hash(),
             cat_amount_0,
         )
         eve_spend = await wallet_node_0.wallet_state_manager.sign_transaction(
@@ -1051,9 +1041,6 @@ class TestCATWallet:
         await full_node_api.farm_blocks_to_wallet(count=num_blocks, wallet=wallet_0)
         await full_node_api.wait_for_wallet_synced(wallet_node=wallet_node_0, timeout=20)
 
-        async def check_wallets(node):
-            return len(node.wallet_state_manager.wallets.keys())
-
         await time_out_assert(20, check_wallets, 2, wallet_node_0)
         cat_wallet = wallet_node_0.wallet_state_manager.wallets[uint32(2)]
         await time_out_assert(20, cat_wallet.get_confirmed_balance, cat_amount_1)
@@ -1064,9 +1051,7 @@ class TestCATWallet:
 async def test_unacknowledged_cat_table() -> None:
     db_name = Path(tempfile.TemporaryDirectory().name).joinpath("test.sqlite")
     db_name.parent.mkdir(parents=True, exist_ok=True)
-    async with DBWrapper2.managed(
-        database=db_name,
-    ) as db_wrapper:
+    async with DBWrapper2.managed(database=db_name) as db_wrapper:
         interested_store = await WalletInterestedStore.create(db_wrapper)
 
         def asset_id(i: int) -> bytes32:
@@ -1075,22 +1060,10 @@ async def test_unacknowledged_cat_table() -> None:
         def coin_state(i: int) -> CoinState:
             return CoinState(Coin(bytes32([0] * 32), bytes32([0] * 32), uint64(i)), None, None)
 
-        await interested_store.add_unacknowledged_coin_state(
-            asset_id(0),
-            coin_state(0),
-            None,
-        )
-        await interested_store.add_unacknowledged_coin_state(
-            asset_id(1),
-            coin_state(1),
-            100,
-        )
+        await interested_store.add_unacknowledged_coin_state(asset_id(0), coin_state(0), None)
+        await interested_store.add_unacknowledged_coin_state(asset_id(1), coin_state(1), 100)
         assert await interested_store.get_unacknowledged_states_for_asset_id(asset_id(0)) == [(coin_state(0), 0)]
-        await interested_store.add_unacknowledged_coin_state(
-            asset_id(0),
-            coin_state(0),
-            None,
-        )
+        await interested_store.add_unacknowledged_coin_state(asset_id(0), coin_state(0), None)
         assert await interested_store.get_unacknowledged_states_for_asset_id(asset_id(0)) == [(coin_state(0), 0)]
         assert await interested_store.get_unacknowledged_states_for_asset_id(asset_id(1)) == [(coin_state(1), 100)]
         assert await interested_store.get_unacknowledged_states_for_asset_id(asset_id(2)) == []
