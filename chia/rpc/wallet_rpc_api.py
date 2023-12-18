@@ -2094,7 +2094,7 @@ class WalletRpcApi:
     async def did_get_wallet_name(self, request: Dict[str, Any]) -> EndpointResult:
         wallet_id = uint32(request["wallet_id"])
         wallet = self.service.wallet_state_manager.get_wallet(id=wallet_id, required_type=DIDWallet)
-        name: str = wallet.get_name()  # type: ignore[no-untyped-call]  # Missing hint in `did_wallet.py`
+        name = wallet.get_name()
         return {"success": True, "wallet_id": wallet_id, "name": name}
 
     @tx_endpoint
@@ -2401,18 +2401,13 @@ class WalletRpcApi:
         if "metadata" in request and type(request["metadata"]) is dict:
             metadata = request["metadata"]
         async with self.service.wallet_state_manager.lock:
-            update_success = await wallet.update_metadata(metadata)
+            await wallet.update_metadata(metadata)
             # Update coin with new ID info
-            if update_success:
-                spend_bundle = await wallet.create_update_spend(
-                    tx_config, uint64(request.get("fee", 0)), extra_conditions=extra_conditions
-                )
-                if spend_bundle is not None:
-                    return {"wallet_id": wallet_id, "success": True, "spend_bundle": spend_bundle}
-                else:
-                    return {"success": False, "error": "Couldn't create an update spend bundle."}
+            spend_bundle = await wallet.create_update_spend(tx_config, uint64(request.get("fee", 0)), extra_conditions)
+            if spend_bundle is not None:
+                return {"wallet_id": wallet_id, "success": True, "spend_bundle": spend_bundle}
             else:
-                return {"success": False, "error": f"Couldn't update metadata with input: {metadata}"}
+                return {"success": False, "error": "Couldn't create an update spend bundle."}
 
     async def did_get_did(self, request: Dict[str, Any]) -> EndpointResult:
         wallet_id = uint32(request["wallet_id"])
@@ -2494,10 +2489,7 @@ class WalletRpcApi:
 
     @tx_endpoint
     async def did_create_attest(
-        self,
-        request: Dict[str, Any],
-        tx_config: TXConfig = DEFAULT_TX_CONFIG,
-        extra_conditions: Tuple[Condition, ...] = tuple(),
+        self, request: Dict[str, Any], extra_conditions: Tuple[Condition, ...] = tuple()
     ) -> EndpointResult:
         wallet_id = uint32(request["wallet_id"])
         wallet = self.service.wallet_state_manager.get_wallet(id=wallet_id, required_type=DIDWallet)
@@ -2506,11 +2498,7 @@ class WalletRpcApi:
             coin = bytes32.from_hexstr(request["coin_name"])
             pubkey = G1Element.from_bytes(hexstr_to_bytes(request["pubkey"]))
             spend_bundle, attest_data = await wallet.create_attestment(
-                coin,
-                bytes32.from_hexstr(request["puzhash"]),
-                pubkey,
-                tx_config,
-                extra_conditions=extra_conditions,
+                coin, bytes32.from_hexstr(request["puzhash"]), pubkey, extra_conditions=extra_conditions
             )
         if info is not None and spend_bundle is not None:
             return {
