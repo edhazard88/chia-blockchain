@@ -110,7 +110,6 @@ tests.wallet.cat_wallet.test_offer_lifecycle
 tests.wallet.cat_wallet.test_trades
 tests.wallet.did_wallet.test_did
 tests.wallet.nft_wallet.test_nft_wallet
-tests.wallet.rpc.test_wallet_rpc
 tests.wallet.simple_sync.test_simple_sync_protocol
 tests.wallet.sync.test_wallet_sync
 tests.wallet.test_bech32m

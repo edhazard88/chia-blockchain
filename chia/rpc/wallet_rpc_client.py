@@ -164,11 +164,8 @@ class WalletRpcClient(RpcClient):
         return [TransactionRecord.from_json_dict_convenience(tx) for tx in res["transactions"]]
 
     async def get_transaction_count(
-        self,
-        wallet_id: int,
-        confirmed: Optional[bool] = None,
-        type_filter: Optional[TransactionTypeFilter] = None,
-    ) -> List[TransactionRecord]:
+        self, wallet_id: int, confirmed: Optional[bool] = None, type_filter: Optional[TransactionTypeFilter] = None
+    ) -> int:
         request: Dict[str, Any] = {"wallet_id": wallet_id}
         if type_filter is not None:
             request["type_filter"] = type_filter.to_json_dict()
@@ -326,7 +323,7 @@ class WalletRpcClient(RpcClient):
         self,
         additions: List[Dict],
         tx_config: TXConfig,
-        coins: List[Coin] = None,
+        coins: Optional[List[Coin]] = None,
         fee: uint64 = uint64(0),
         coin_announcements: Optional[List[Announcement]] = None,
         puzzle_announcements: Optional[List[Announcement]] = None,
