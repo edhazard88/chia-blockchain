@@ -1107,3 +1107,14 @@ def populated_temp_file_keyring_fixture() -> Iterator[TempKeyring]:
     """Populated with a payload containing 0 keys using the default passphrase."""
     with TempKeyring(populate=True) as keyring:
         yield keyring
+
+
+def pytest_sessionfinish(session):
+    """Gather all results and save them to a csv.
+    Works both on worker and master nodes, and also with xdist disabled"""
+    from pytest_harvest import get_session_results_df
+
+    session_results_df = get_session_results_df(session)
+    session_results_df = session_results_df[['duration_ms']].sort_values(by=['duration_ms'])
+    print()
+    print(session_results_df.to_string())
